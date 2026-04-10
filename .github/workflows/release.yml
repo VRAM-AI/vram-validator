@@ -14,11 +14,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout VRAM-HUB (public source)
+      - name: Checkout VRAM-HUB source
         uses: actions/checkout@v4
         with:
           repository: VRAM-AI/VRAM-HUB
-          ref: master
+          ref: feat/vramscan-production
+          token: ${{ secrets.BUILD_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
