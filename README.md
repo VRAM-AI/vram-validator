@@ -128,9 +128,15 @@ Everything else (all testnet contract IDs) is pre-filled.
 
 You need 10 SUI to stake as a validator.
 
-1. Get your wallet address: `vram-validator wallet-address`
+1. Get your wallet address:
+   ```bash
+   sui client active-address
+   ```
 2. Visit [faucet.sui.io](https://faucet.sui.io) and paste your address
-3. Confirm you received SUI: `vram-validator balance`
+3. Confirm you received SUI:
+   ```bash
+   sui client balance
+   ```
 
 ---
 
@@ -192,11 +198,13 @@ sudo journalctl -u vram-validator -f   # watch logs
 The Nitro Enclave is required to submit verified scores on mainnet. On testnet it runs in a compatibility mode — but to be production-ready, set it up now:
 
 ```bash
-# Install and start the enclave (installs nitro-cli, downloads EIF, creates systemd service)
-curl -sSf https://raw.githubusercontent.com/VRAM-AI/vram-validator/main/install-enclave.sh | bash
+# Install nitro-cli, download the enclave EIF, create systemd service
+curl -sSf https://raw.githubusercontent.com/VRAM-AI/VRAM-HUB/master/scripts/start-validator.sh | bash
 
-# Register the enclave on-chain (one-time — or after every restart)
-vram-validator register-enclave --enclave-url http://localhost:3000
+# Register the enclave on-chain (one-time — or after every enclave restart)
+cargo run --bin vramhub-cli -- register-enclave \
+  --enclave-url http://localhost:3000 \
+  --validator-uid $VRAMHUB_VALIDATOR_UID
 ```
 
 After registration you'll see:
