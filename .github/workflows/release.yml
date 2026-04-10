@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: VRAM-AI/vramhub-validator   # private source repo
+          token: ${{ secrets.BUILD_TOKEN }}         # PAT with read access to private repo
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - run: sudo apt-get install -y musl-tools
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build static binary
+        run: |
+          cargo build --release --bin slcl-validator \
+            --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/slcl-validator \
+             vram-validator-linux-x86_64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: VRAM-AI/vram-validator
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: vram-validator-linux-x86_64
+          body: |
+            ## vram-validator ${{ github.ref_name }}
+
+            ### Install
+
+            ```bash
+            curl -sSf https://raw.githubusercontent.com/VRAM-AI/vram-validator/main/install.sh | bash
+            ```
+
+            ### Manual download
+
+            ```bash
+            curl -Lo vram-validator \
+              https://github.com/VRAM-AI/vram-validator/releases/download/${{ github.ref_name }}/vram-validator-linux-x86_64
+            chmod +x vram-validator && ./vram-validator
+            ```
+
+            ### Requirements
+            - Linux (Ubuntu 22.04+ / Amazon Linux 2023)
+            - AWS EC2 with Nitro Enclave enabled (`m7i.xlarge` or larger)
+            - 10 SUI minimum stake on testnet
