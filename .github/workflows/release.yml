@@ -22,10 +22,8 @@ jobs:
           token: ${{ secrets.BUILD_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - run: sudo apt-get install -y musl-tools perl make
+      - run: sudo apt-get install -y libssl-dev pkg-config
 
       - uses: actions/cache@v4
         with:
@@ -35,15 +33,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build static binary
-        env:
-          OPENSSL_STATIC: "1"
-          OPENSSL_VENDORED: "1"
+      - name: Build binary
         run: |
-          cargo build --release --bin vramhub-validator \
-            --target x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/vramhub-validator \
-             vram-validator-linux-x86_64
+          cargo build --release --bin vramhub-validator
+          cp target/release/vramhub-validator vram-validator-linux-x86_64
 
       - name: Release
         uses: softprops/action-gh-release@v2
