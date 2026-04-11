@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout VRAM-HUB source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           repository: VRAM-AI/VRAM-HUB
           ref: feat/vramscan-production
@@ -25,7 +25,7 @@ jobs:
 
       - run: sudo apt-get install -y libssl-dev pkg-config
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -39,7 +39,7 @@ jobs:
           cp target/release/vramhub-validator vram-validator-linux-x86_64
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.3.2
         with:
           files: vram-validator-linux-x86_64
           body: |
