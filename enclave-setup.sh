@@ -198,10 +198,16 @@ mkdir -p /var/log/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
 
-nitro-cli build-enclave \
+if ! nitro-cli build-enclave \
     --docker-uri slcl-nautilus:latest \
     --output-file "$EIF_PATH" \
-    > "$BUILD_OUT"
+    > "$BUILD_OUT" 2>&1; then
+    echo
+    warn "nitro-cli build-enclave failed. Error log:"
+    ERRLOG=$(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -1)
+    [[ -n "$ERRLOG" ]] && cat "$ERRLOG" || echo "(no error log found)"
+    fatal "EIF build failed — see above"
+fi
 
 PCR0=$(jq -r '.Measurements.PCR0' "$BUILD_OUT")
 PCR1=$(jq -r '.Measurements.PCR1' "$BUILD_OUT")
