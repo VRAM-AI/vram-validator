@@ -394,7 +394,7 @@ ok "Enclave started: $ENCLAVE_ID"
 step "Setting up vsock-proxy bridge (localhost:3000 → CID ${ENCLAVE_CID}:3000)"
 apt-get install -y -qq socat
 
-cat > /etc/systemd/system/vram-vsock-bridge.service <<SERVICE
+tee /etc/systemd/system/vram-vsock-bridge.service > /dev/null << SVCEOF
 [Unit]
 Description=VRAM vsock bridge (TCP 3000 -> enclave vsock:${ENCLAVE_CID}:3000)
 After=network-online.target
@@ -408,7 +408,7 @@ RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+SVCEOF
 
 systemctl daemon-reload
 systemctl enable --now vram-vsock-bridge.service
