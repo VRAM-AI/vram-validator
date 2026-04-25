@@ -171,6 +171,7 @@ ok "Built slcl-nautilus:latest"
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
 step "Building Enclave Image File (EIF)"
 mkdir -p "$INSTALL_DIR"
+mkdir -p /var/log/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
 
