@@ -173,33 +173,31 @@ else
     if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
         fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
     fi
-    CPU_LIST=$(python3 - <<PYEOF
-import os
-enclave_cpus = ${ENCLAVE_CPU_COUNT}
-total = os.cpu_count()
-seen = set()
-groups = []
-for cpu in range(total - 1, -1, -1):
-    try:
-        raw = open(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list').read().strip()
-    except OSError:
-        raw = str(cpu)
-    sibs = set()
-    for part in raw.split(','):
-        if '-' in part:
-            a, b = part.split('-')
-            sibs.update(range(int(a), int(b)+1))
-        else:
-            sibs.add(int(part))
-    if min(sibs) in seen:
+    # Use lscpu -p to build a core→cpu mapping (reliable on all kernels/hypervisors)
+    CPU_LIST=$(python3 - "${ENCLAVE_CPU_COUNT}" <<'PYEOF'
+import subprocess, sys, collections
+
+enclave_cpus = int(sys.argv[1])
+
+# lscpu -p outputs lines like: CPU,Core,Socket,... (skip comment lines)
+out = subprocess.check_output(['lscpu', '-p'], text=True)
+core_to_cpus = collections.defaultdict(list)
+for line in out.splitlines():
+    if line.startswith('#') or not line.strip():
         continue
-    seen.update(sibs)
-    groups.append(sorted(sibs))
+    fields = line.split(',')
+    cpu_id, core_id = int(fields[0]), int(fields[1])
+    core_to_cpus[core_id].append(cpu_id)
+
+# Sort cores descending (prefer higher-numbered cores, avoiding core 0)
+sorted_cores = sorted(core_to_cpus.keys(), reverse=True)
+
 pool = []
-for grp in groups:
+for core in sorted_cores:
     if len(pool) >= enclave_cpus:
         break
-    pool.extend(grp)
+    pool.extend(core_to_cpus[core])
+
 print(','.join(str(c) for c in sorted(pool)))
 PYEOF
 )
