@@ -199,6 +199,23 @@ else
     fi
 fi
 
+# Write the nitro_enclaves.conf so nitro-cli knows where the blobs are
+mkdir -p /etc/nitro_enclaves
+if [[ ! -f /etc/nitro_enclaves/nitro_enclaves.conf ]]; then
+    cat > /etc/nitro_enclaves/nitro_enclaves.conf <<CONF
+# Nitro Enclaves configuration
+blobs_path=${BLOBS_DIR}
+CONF
+    ok "Wrote /etc/nitro_enclaves/nitro_enclaves.conf"
+fi
+
+# Show where nitro-cli binary is and what blob path it has embedded
+NITRO_BIN=$(command -v nitro-cli)
+ok "nitro-cli binary: $NITRO_BIN"
+EMBEDDED_PATH=$(strings "$NITRO_BIN" 2>/dev/null | grep -i "nitro_enclaves/blobs" | head -1 || echo "(none found)")
+ok "Embedded blob path hint: $EMBEDDED_PATH"
+ok "Blobs directory contents: $(ls $BLOBS_DIR | tr '\n' ' ')"
+
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
 step "Building Enclave Image File (EIF)"
 mkdir -p "$INSTALL_DIR"
