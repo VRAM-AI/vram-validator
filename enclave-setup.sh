@@ -269,20 +269,18 @@ ok "Downloaded slcl-nautilus ($(numfmt --to=iec-i --suffix=B "$SIZE"))"
 
 # ─── 7. Build Docker image for EIF ──────────────────────────────────────────
 step "Building Docker image for EIF"
-# slcl-nautilus listens on TCP 0.0.0.0:3000 (not vsock).
-# The enclave has no network interface reachable from the host, so we add
-# an in-enclave socat bridge that listens on vsock:3000 and forwards to
-# the nautilus's TCP:3000.  The host-side socat then bridges TCP→vsock.
+# slcl-nautilus listens on vsock natively (VMADDR_CID_ANY:3000).
+# The host-side socat bridges: TCP-LISTEN:3000 → VSOCK-CONNECT:CID:3000.
+# FROM scratch keeps the EIF minimal and the PCR measurements stable.
 cat > "$BUILD_DIR/Dockerfile" <<'EOF'
-FROM alpine:3.19
-RUN apk add --no-cache socat
+FROM scratch
 COPY slcl-nautilus /app/slcl-nautilus
 ENV PORT=3000
-ENTRYPOINT ["/bin/sh", "-c", "socat VSOCK-LISTEN:3000,reuseaddr,fork TCP:127.0.0.1:3000 & exec /app/slcl-nautilus"]
+ENTRYPOINT ["/app/slcl-nautilus"]
 EOF
 
 docker build -t slcl-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v "^#" | tail -5
-ok "Built slcl-nautilus:latest (alpine + vsock bridge)"
+ok "Built slcl-nautilus:latest"
 
 # ─── 6b. Ensure nitro-cli blobs are present ─────────────────────────────────
 step "Checking nitro-cli blobs"
@@ -489,19 +487,21 @@ echo "  ${C_BOLD}Endpoint:${C_RESET}       http://localhost:3000"
 echo
 echo "  ${C_BOLD}Next steps:${C_RESET}"
 echo
-echo "  1. Register the enclave on-chain:"
+echo "  1. Register as a validator peer (first time only):"
 echo "     ${C_CYAN}source ~/.env${C_RESET}"
-echo "     ${C_CYAN}vram-cli register-enclave --enclave-url http://localhost:3000${C_RESET}"
-echo "     Save the printed VRAMHUB_ENCLAVE_OBJECT_ID into ~/.env"
-echo
-echo "  2. Register as a validator:"
 echo "     ${C_CYAN}vram-cli register-validator${C_RESET}"
-echo "     Save the printed VRAMHUB_VALIDATOR_UID into ~/.env"
+echo "     # Prints: VRAMHUB_VALIDATOR_UID=<uid>"
+echo "     ${C_CYAN}echo 'VRAMHUB_VALIDATOR_UID=<uid>' >> ~/.env${C_RESET}"
 echo
-echo "  3. Also set in ~/.env:"
-echo "     ${C_CYAN}VRAMHUB_ENCLAVE_PUBKEY=<from register-enclave output>${C_RESET}"
-echo "     ${C_CYAN}VRAMHUB_NITRO_ENCLAVE=true${C_RESET}"
-echo "     ${C_CYAN}VRAMHUB_TEST_MODE=false${C_RESET}"
+echo "  2. Register the enclave on-chain:"
+echo "     ${C_CYAN}source ~/.env${C_RESET}"
+echo '     '"${C_CYAN}"'vram-cli register-enclave --enclave-url http://localhost:3000 --validator-uid $VRAMHUB_VALIDATOR_UID'"${C_RESET}"
+echo "     # Prints: VRAMHUB_ENCLAVE_PUBKEY=<hex>"
+echo "     ${C_CYAN}echo 'VRAMHUB_ENCLAVE_PUBKEY=<hex>' >> ~/.env${C_RESET}"
+echo
+echo "  3. Enable production mode in ~/.env:"
+echo "     ${C_CYAN}echo 'VRAMHUB_NITRO_ENCLAVE=true'  >> ~/.env${C_RESET}"
+echo "     ${C_CYAN}echo 'VRAMHUB_TEST_MODE=false'     >> ~/.env${C_RESET}"
 echo
 echo "  4. Run the validator:"
 echo "     ${C_CYAN}source ~/.env && vram-validator${C_RESET}"
