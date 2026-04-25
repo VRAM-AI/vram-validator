@@ -234,9 +234,18 @@ if ! nitro-cli build-enclave \
     fatal "EIF build failed — see above"
 fi
 
-PCR0=$(jq -r '.Measurements.PCR0' "$BUILD_OUT")
-PCR1=$(jq -r '.Measurements.PCR1' "$BUILD_OUT")
-PCR2=$(jq -r '.Measurements.PCR2' "$BUILD_OUT")
+# nitro-cli outputs "Start building..." before the JSON — extract just the JSON block
+JSON_BLOCK=$(python3 -c "
+import sys, re
+data = open('$BUILD_OUT').read()
+m = re.search(r'(\{.*\})', data, re.DOTALL)
+print(m.group(1) if m else '{}')
+")
+PCR0=$(echo "$JSON_BLOCK" | jq -r '.Measurements.PCR0 // empty')
+PCR1=$(echo "$JSON_BLOCK" | jq -r '.Measurements.PCR1 // empty')
+PCR2=$(echo "$JSON_BLOCK" | jq -r '.Measurements.PCR2 // empty')
+# Rewrite build-output.json with clean JSON only
+echo "$JSON_BLOCK" > "$BUILD_OUT"
 
 ok "EIF built: $EIF_PATH"
 echo "    PCR0: ${PCR0:0:32}..."
