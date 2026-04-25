@@ -362,13 +362,31 @@ nitro-cli run-enclave \
     --enclave-cid "$ENCLAVE_CID" \
     $DEBUG_FLAG > /tmp/run-enclave.json 2>&1 || true
 
-ENCLAVE_ID=$(jq -r '.EnclaveID // empty' /tmp/run-enclave.json 2>/dev/null || echo "")
+# nitro-cli mixes status text, JSON, and error text in a single stream.
+# Extract the JSON block with regex, then fall back to describe-enclaves
+# to confirm the enclave is actually running (the IPC monitor error is
+# non-fatal when the enclave itself started successfully).
+RUN_JSON=$(python3 -c "
+import sys, re
+data = open('/tmp/run-enclave.json').read()
+m = re.search(r'(\{[^{}]*\"EnclaveID\"[^{}]*\})', data, re.DOTALL)
+print(m.group(1) if m else '{}')
+" 2>/dev/null || echo '{}')
+
+ENCLAVE_ID=$(echo "$RUN_JSON" | jq -r '.EnclaveID // empty' 2>/dev/null || echo "")
+
+# If jq found nothing, check whether an enclave with our CID is already running
+if [[ -z "$ENCLAVE_ID" ]]; then
+    ENCLAVE_ID=$(nitro-cli describe-enclaves 2>/dev/null | \
+        jq -r ".[] | select(.EnclaveCID == ${ENCLAVE_CID}) | .EnclaveID" 2>/dev/null || echo "")
+fi
+
 if [[ -z "$ENCLAVE_ID" ]]; then
     warn "run-enclave output:"
     cat /tmp/run-enclave.json
     ERRLOG=$(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -1)
     [[ -n "$ERRLOG" ]] && cat "$ERRLOG"
-    fatal "Failed to start enclave"
+    fatal "Failed to start enclave — re-run with ENCLAVE_DEBUG=true for console output"
 fi
 ok "Enclave started: $ENCLAVE_ID"
 
