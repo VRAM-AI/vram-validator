@@ -218,12 +218,15 @@ ok "Blobs directory contents: $(ls $BLOBS_DIR | tr '\n' ' ')"
 
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
 step "Building Enclave Image File (EIF)"
-mkdir -p "$INSTALL_DIR"
-mkdir -p /var/log/nitro_enclaves
+mkdir -p "$INSTALL_DIR" /var/log/nitro_enclaves /run/nitro_enclaves
+chmod 750 /run/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
 
-if ! nitro-cli build-enclave \
+if [[ -f "$EIF_PATH" ]] && [[ -f "$BUILD_OUT" ]] && \
+   grep -q 'PCR0' "$BUILD_OUT" 2>/dev/null; then
+    ok "EIF already exists, skipping build"
+elif ! nitro-cli build-enclave \
     --docker-uri slcl-nautilus:latest \
     --output-file "$EIF_PATH" \
     > "$BUILD_OUT" 2>&1; then
@@ -254,7 +257,7 @@ echo "    PCR2: ${PCR2:0:32}..."
 
 # ─── 8. Terminate any previously running enclave ────────────────────────────
 step "Stopping any existing enclaves"
-RUNNING=$(nitro-cli describe-enclaves | jq -r '.[].EnclaveID' 2>/dev/null || echo "")
+RUNNING=$(nitro-cli describe-enclaves 2>/dev/null | jq -r '.[].EnclaveID' 2>/dev/null || echo "")
 if [[ -n "$RUNNING" ]]; then
     for eid in $RUNNING; do
         nitro-cli terminate-enclave --enclave-id "$eid" >/dev/null
@@ -271,14 +274,24 @@ if [[ "$ENCLAVE_DEBUG" == "true" ]]; then
     DEBUG_FLAG="--debug-mode"
 fi
 
+mkdir -p /run/nitro_enclaves
+chmod 750 /run/nitro_enclaves
+
 nitro-cli run-enclave \
     --eif-path "$EIF_PATH" \
     --memory "$ENCLAVE_MEMORY_MIB" \
     --cpu-count "$ENCLAVE_CPU_COUNT" \
     --enclave-cid "$ENCLAVE_CID" \
-    $DEBUG_FLAG > /tmp/run-enclave.json
+    $DEBUG_FLAG > /tmp/run-enclave.json 2>&1 || true
 
-ENCLAVE_ID=$(jq -r '.EnclaveID' /tmp/run-enclave.json)
+ENCLAVE_ID=$(jq -r '.EnclaveID // empty' /tmp/run-enclave.json 2>/dev/null || echo "")
+if [[ -z "$ENCLAVE_ID" ]]; then
+    warn "run-enclave output:"
+    cat /tmp/run-enclave.json
+    ERRLOG=$(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -1)
+    [[ -n "$ERRLOG" ]] && cat "$ERRLOG"
+    fatal "Failed to start enclave"
+fi
 ok "Enclave started: $ENCLAVE_ID"
 
 # ─── 10. vsock-proxy: localhost:3000 → enclave:3000 ─────────────────────────
