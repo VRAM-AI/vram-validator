@@ -239,7 +239,18 @@ PYEOF
     ok "Pool settings saved (persists across reboots)"
 fi
 
-# ─── 5. Download pre-built nautilus binary ──────────────────────────────────
+# ─── 5. Install vram-cli (on-chain registration tool) ───────────────────────
+step "Installing vram-cli"
+if command -v vram-cli >/dev/null 2>&1; then
+    ok "vram-cli already installed: $(vram-cli --version 2>&1 | head -1)"
+else
+    curl -fsSL --retry 3 -o /usr/local/bin/vram-cli \
+        "${RELEASE_URL}/vram-cli-linux-x86_64"
+    chmod +x /usr/local/bin/vram-cli
+    ok "vram-cli installed"
+fi
+
+# ─── 6. Download pre-built nautilus binary ──────────────────────────────────
 step "Downloading pre-built slcl-nautilus binary"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
