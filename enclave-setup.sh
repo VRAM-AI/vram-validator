@@ -171,24 +171,32 @@ ok "Built slcl-nautilus:latest"
 # ─── 6b. Ensure nitro-cli blobs are present ─────────────────────────────────
 step "Checking nitro-cli blobs"
 BLOBS_DIR=/usr/share/nitro_enclaves/blobs
-if [[ ! -f "$BLOBS_DIR/cmdline" ]]; then
-    warn "Blobs not found at $BLOBS_DIR — downloading from AWS repo"
-    mkdir -p "$BLOBS_DIR"
-    # Clone the matching tag if nitro-cli is a known version, else use main
-    NITRO_VER=$(nitro-cli --version 2>&1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || echo "")
-    BLOBS_REF="main"
-    if [[ -n "$NITRO_VER" ]]; then
-        BLOBS_REF="v${NITRO_VER}"
-    fi
-    BLOBS_BASE="https://raw.githubusercontent.com/aws/aws-nitro-enclaves-cli/${BLOBS_REF}/blobs/x86_64"
-    for f in cmdline init nsm.ko linuxkit; do
-        curl -fsSL -o "$BLOBS_DIR/$f" "$BLOBS_BASE/$f" \
-            || warn "Could not download blob: $f"
-    done
-    chmod +x "$BLOBS_DIR/linuxkit" "$BLOBS_DIR/init" 2>/dev/null || true
-    ok "Blobs installed to $BLOBS_DIR"
-else
+
+# Verify blobs are real binary files (not empty or HTML 404 pages)
+blobs_ok() {
+    [[ -f "$BLOBS_DIR/cmdline" ]] && \
+    [[ -f "$BLOBS_DIR/linuxkit" ]] && \
+    [[ $(stat -c%s "$BLOBS_DIR/cmdline") -gt 10 ]] && \
+    [[ $(stat -c%s "$BLOBS_DIR/linuxkit") -gt 10000 ]]
+}
+
+if blobs_ok; then
     ok "Blobs present at $BLOBS_DIR"
+else
+    warn "Blobs missing or invalid — cloning AWS repo to get them"
+    mkdir -p "$BLOBS_DIR"
+    rm -rf /tmp/nitro-cli-src
+    git clone --depth 1 \
+        https://github.com/aws/aws-nitro-enclaves-cli.git \
+        /tmp/nitro-cli-src
+    cp /tmp/nitro-cli-src/blobs/x86_64/* "$BLOBS_DIR/"
+    chmod +x "$BLOBS_DIR/linuxkit" "$BLOBS_DIR/init" 2>/dev/null || true
+    rm -rf /tmp/nitro-cli-src
+    if blobs_ok; then
+        ok "Blobs installed to $BLOBS_DIR"
+    else
+        fatal "Could not install nitro-cli blobs — check the repo structure"
+    fi
 fi
 
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
