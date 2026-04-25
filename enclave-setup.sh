@@ -104,10 +104,12 @@ step "Installing nitro-cli"
 if command -v nitro-cli >/dev/null 2>&1; then
     ok "nitro-cli already installed: $(nitro-cli --version 2>&1 | head -1)"
 else
-    if apt-get install -y -qq aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel 2>/dev/null; then
+    # Try the apt package first (installs allocator service too); -devel is optional
+    if apt-get install -y -qq aws-nitro-enclaves-cli 2>/dev/null; then
+        apt-get install -y -qq aws-nitro-enclaves-cli-devel 2>/dev/null || true
         ok "Installed aws-nitro-enclaves-cli via apt"
     else
-        warn "apt package unavailable, using release binary"
+        warn "aws-nitro-enclaves-cli not in apt (normal on Ubuntu 24.04) — using release binary"
         curl -fsSL -o /usr/local/bin/nitro-cli \
             "${RELEASE_URL}/nitro-cli-linux-x86_64"
         chmod +x /usr/local/bin/nitro-cli
@@ -136,13 +138,59 @@ memory_mib: ${ENCLAVE_MEMORY_MIB}
 cpu_count: ${ENCLAVE_CPU_COUNT}
 YAML
 
-if systemctl list-unit-files nitro-enclaves-allocator.service >/dev/null 2>&1; then
-    systemctl enable --now nitro-enclaves-allocator.service
+# Detect if the allocator systemd unit is installed (aws-nitro-enclaves-cli apt package)
+ALLOC_SVC=$(systemctl list-unit-files 2>/dev/null | grep nitro-enclaves-allocator | head -1 || true)
+
+if [[ -n "$ALLOC_SVC" ]]; then
+    systemctl enable nitro-enclaves-allocator.service
     systemctl restart nitro-enclaves-allocator.service
     sleep 2
     ok "Allocator service running"
 else
-    warn "nitro-enclaves-allocator.service not found; memory must be reserved on each boot"
+    # No allocator service — reserve resources directly via the kernel module.
+    #
+    # The nitro_enclaves module accepts an `ne_cpus` parameter at load time that
+    # takes CPU IDs offline from the host and adds them to the enclave pool.
+    # We reload the module with this parameter to configure the pool.
+    # This is the standard alternative to the allocator binary on systems where
+    # the aws-nitro-enclaves-cli apt package is not installed.
+
+    warn "nitro-enclaves-allocator.service not found — configuring pool via kernel module"
+
+    # 1. Reserve huge pages for enclave memory (each page is 2 MiB)
+    HUGE_PAGES=$((ENCLAVE_MEMORY_MIB / 2))
+    echo "$HUGE_PAGES" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+    ACTUAL_HP=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+    ok "Huge pages: ${ACTUAL_HP} × 2 MiB = $((ACTUAL_HP * 2)) MiB reserved"
+
+    # 2. Choose which CPUs to dedicate to the enclave pool.
+    #    Use the last N CPUs, keeping CPU 0 (IRQ handling) on the host.
+    TOTAL_CPUS=$(nproc --all)
+    if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
+        fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
+    fi
+    CPU_START=$((TOTAL_CPUS - ENCLAVE_CPU_COUNT))
+    CPU_LIST=$(seq -s, "$CPU_START" "$((TOTAL_CPUS - 1))")
+    ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total)"
+
+    # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool
+    if lsmod | grep -q "^nitro_enclaves"; then
+        rmmod nitro_enclaves 2>/dev/null || \
+            fatal "Could not unload nitro_enclaves module (in use?). Try rebooting."
+        sleep 0.5
+    fi
+    if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
+        dmesg | tail -10 >&2
+        fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
+    fi
+    ok "nitro_enclaves loaded with ne_cpus=${CPU_LIST}"
+
+    # 4. Persist across reboots
+    echo "options nitro_enclaves ne_cpus=${CPU_LIST}" \
+        > /etc/modprobe.d/nitro_enclaves.conf
+    echo "vm.nr_hugepages=${HUGE_PAGES}" \
+        > /etc/sysctl.d/20-nitro-enclaves.conf
+    ok "Pool settings saved (persists across reboots)"
 fi
 
 # ─── 5. Download pre-built nautilus binary ──────────────────────────────────
