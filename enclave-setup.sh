@@ -168,6 +168,29 @@ EOF
 docker build -t slcl-nautilus:latest "$BUILD_DIR/" >/dev/null
 ok "Built slcl-nautilus:latest"
 
+# ─── 6b. Ensure nitro-cli blobs are present ─────────────────────────────────
+step "Checking nitro-cli blobs"
+BLOBS_DIR=/usr/share/nitro_enclaves/blobs
+if [[ ! -f "$BLOBS_DIR/cmdline" ]]; then
+    warn "Blobs not found at $BLOBS_DIR — downloading from AWS repo"
+    mkdir -p "$BLOBS_DIR"
+    # Clone the matching tag if nitro-cli is a known version, else use main
+    NITRO_VER=$(nitro-cli --version 2>&1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || echo "")
+    BLOBS_REF="main"
+    if [[ -n "$NITRO_VER" ]]; then
+        BLOBS_REF="v${NITRO_VER}"
+    fi
+    BLOBS_BASE="https://raw.githubusercontent.com/aws/aws-nitro-enclaves-cli/${BLOBS_REF}/blobs/x86_64"
+    for f in cmdline init nsm.ko linuxkit; do
+        curl -fsSL -o "$BLOBS_DIR/$f" "$BLOBS_BASE/$f" \
+            || warn "Could not download blob: $f"
+    done
+    chmod +x "$BLOBS_DIR/linuxkit" "$BLOBS_DIR/init" 2>/dev/null || true
+    ok "Blobs installed to $BLOBS_DIR"
+else
+    ok "Blobs present at $BLOBS_DIR"
+fi
+
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
 step "Building Enclave Image File (EIF)"
 mkdir -p "$INSTALL_DIR"
