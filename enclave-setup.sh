@@ -164,14 +164,46 @@ else
     ok "Huge pages: ${ACTUAL_HP} × 2 MiB = $((ACTUAL_HP * 2)) MiB reserved"
 
     # 2. Choose which CPUs to dedicate to the enclave pool.
-    #    Use the last N CPUs, keeping CPU 0 (IRQ handling) on the host.
+    #    The driver requires ALL hyperthreads of a physical core to be in the
+    #    pool together — you cannot mix threads from different cores.
+    #    We walk CPUs from the end (avoiding CPU 0 which handles IRQs), read
+    #    each CPU's thread_siblings_list, and accumulate whole cores until we
+    #    have enough vCPUs.
     TOTAL_CPUS=$(nproc --all)
     if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
         fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
     fi
-    CPU_START=$((TOTAL_CPUS - ENCLAVE_CPU_COUNT))
-    CPU_LIST=$(seq -s, "$CPU_START" "$((TOTAL_CPUS - 1))")
-    ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total)"
+    CPU_LIST=$(python3 - <<PYEOF
+import os
+enclave_cpus = ${ENCLAVE_CPU_COUNT}
+total = os.cpu_count()
+seen = set()
+groups = []
+for cpu in range(total - 1, -1, -1):
+    try:
+        raw = open(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list').read().strip()
+    except OSError:
+        raw = str(cpu)
+    sibs = set()
+    for part in raw.split(','):
+        if '-' in part:
+            a, b = part.split('-')
+            sibs.update(range(int(a), int(b)+1))
+        else:
+            sibs.add(int(part))
+    if min(sibs) in seen:
+        continue
+    seen.update(sibs)
+    groups.append(sorted(sibs))
+pool = []
+for grp in groups:
+    if len(pool) >= enclave_cpus:
+        break
+    pool.extend(grp)
+print(','.join(str(c) for c in sorted(pool)))
+PYEOF
+)
+    ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total, aligned to physical cores)"
 
     # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool
     if lsmod | grep -q "^nitro_enclaves"; then
