@@ -117,8 +117,10 @@ else
     fi
 fi
 
+# Load vsock core first — nitro_enclaves registers its vsock transport against it.
+# Without vsock loaded before the enclave starts, AF_VSOCK connect() returns ENODEV.
+modprobe vsock 2>/dev/null || true
 modprobe nitro_enclaves 2>/dev/null || true
-modprobe vhost_vsock 2>/dev/null || true
 
 # Create the enclave sockets directory early — describe-enclaves needs it.
 # 755 so non-root users (ubuntu) can list enclaves without sudo.
