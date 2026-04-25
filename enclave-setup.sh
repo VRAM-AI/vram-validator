@@ -120,6 +120,13 @@ fi
 modprobe nitro_enclaves 2>/dev/null || true
 modprobe vhost_vsock 2>/dev/null || true
 
+# Create the enclave sockets directory early — describe-enclaves needs it.
+# 755 so non-root users (ubuntu) can list enclaves without sudo.
+# tmpfiles.d entry recreates it on every reboot (it lives on tmpfs).
+mkdir -p /run/nitro_enclaves
+chmod 755 /run/nitro_enclaves
+echo 'd /run/nitro_enclaves 0755 root root -' > /etc/tmpfiles.d/nitro-enclaves.conf
+
 if getent group ne >/dev/null 2>&1; then
     for u in ubuntu ec2-user; do
         if id "$u" >/dev/null 2>&1; then
@@ -203,17 +210,26 @@ PYEOF
 )
     ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total, aligned to physical cores)"
 
-    # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool
-    if lsmod | grep -q "^nitro_enclaves"; then
-        rmmod nitro_enclaves 2>/dev/null || \
-            fatal "Could not unload nitro_enclaves module (in use?). Try rebooting."
-        sleep 0.5
+    # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool.
+    #    Skip if an enclave with our CID is already running (pool already set).
+    EXISTING_ENCLAVE=$(nitro-cli describe-enclaves 2>/dev/null | \
+        jq -r ".[] | select(.EnclaveCID == ${ENCLAVE_CID}) | .EnclaveID" 2>/dev/null || echo "")
+
+    if [[ -n "$EXISTING_ENCLAVE" ]]; then
+        ok "Enclave already running with CID ${ENCLAVE_CID} — CPU pool already configured"
+    else
+        if lsmod | grep -q "^nitro_enclaves"; then
+            if ! rmmod nitro_enclaves 2>/dev/null; then
+                fatal "nitro_enclaves in use — terminate existing enclaves first: sudo nitro-cli terminate-enclave --all"
+            fi
+            sleep 0.5
+        fi
+        if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
+            dmesg | tail -10 >&2
+            fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
+        fi
+        ok "nitro_enclaves loaded with ne_cpus=${CPU_LIST}"
     fi
-    if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
-        dmesg | tail -10 >&2
-        fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
-    fi
-    ok "nitro_enclaves loaded with ne_cpus=${CPU_LIST}"
 
     # 4. Persist across reboots
     echo "options nitro_enclaves ne_cpus=${CPU_LIST}" \
@@ -296,8 +312,7 @@ ok "Blobs directory contents: $(ls $BLOBS_DIR | tr '\n' ' ')"
 
 # ─── 7. Build EIF ───────────────────────────────────────────────────────────
 step "Building Enclave Image File (EIF)"
-mkdir -p "$INSTALL_DIR" /var/log/nitro_enclaves /run/nitro_enclaves
-chmod 750 /run/nitro_enclaves
+mkdir -p "$INSTALL_DIR" /var/log/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
 
@@ -351,9 +366,6 @@ DEBUG_FLAG=""
 if [[ "$ENCLAVE_DEBUG" == "true" ]]; then
     DEBUG_FLAG="--debug-mode"
 fi
-
-mkdir -p /run/nitro_enclaves
-chmod 750 /run/nitro_enclaves
 
 nitro-cli run-enclave \
     --eif-path "$EIF_PATH" \
