@@ -261,17 +261,22 @@ chmod +x "$BUILD_DIR/slcl-nautilus"
 SIZE=$(stat -c%s "$BUILD_DIR/slcl-nautilus")
 ok "Downloaded slcl-nautilus ($(numfmt --to=iec-i --suffix=B "$SIZE"))"
 
-# ─── 6. Build Docker image for EIF ──────────────────────────────────────────
+# ─── 7. Build Docker image for EIF ──────────────────────────────────────────
 step "Building Docker image for EIF"
+# slcl-nautilus listens on TCP 0.0.0.0:3000 (not vsock).
+# The enclave has no network interface reachable from the host, so we add
+# an in-enclave socat bridge that listens on vsock:3000 and forwards to
+# the nautilus's TCP:3000.  The host-side socat then bridges TCP→vsock.
 cat > "$BUILD_DIR/Dockerfile" <<'EOF'
-FROM scratch
+FROM alpine:3.19
+RUN apk add --no-cache socat
 COPY slcl-nautilus /app/slcl-nautilus
 ENV PORT=3000
-ENTRYPOINT ["/app/slcl-nautilus"]
+ENTRYPOINT ["/bin/sh", "-c", "socat VSOCK-LISTEN:3000,reuseaddr,fork TCP:127.0.0.1:3000 & exec /app/slcl-nautilus"]
 EOF
 
-docker build -t slcl-nautilus:latest "$BUILD_DIR/" >/dev/null
-ok "Built slcl-nautilus:latest"
+docker build -t slcl-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v "^#" | tail -5
+ok "Built slcl-nautilus:latest (alpine + vsock bridge)"
 
 # ─── 6b. Ensure nitro-cli blobs are present ─────────────────────────────────
 step "Checking nitro-cli blobs"
@@ -326,10 +331,16 @@ step "Building Enclave Image File (EIF)"
 mkdir -p "$INSTALL_DIR" /var/log/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
+HASH_FILE="$INSTALL_DIR/dockerfile.sha256"
+
+# Hash the Dockerfile so the EIF is rebuilt whenever the image changes
+DOCKERFILE_HASH=$(sha256sum "$BUILD_DIR/Dockerfile" | cut -d' ' -f1)
+CACHED_HASH=$(cat "$HASH_FILE" 2>/dev/null || echo "")
 
 if [[ -f "$EIF_PATH" ]] && [[ -f "$BUILD_OUT" ]] && \
-   grep -q 'PCR0' "$BUILD_OUT" 2>/dev/null; then
-    ok "EIF already exists, skipping build"
+   grep -q 'PCR0' "$BUILD_OUT" 2>/dev/null && \
+   [[ "$DOCKERFILE_HASH" == "$CACHED_HASH" ]]; then
+    ok "EIF already exists (Dockerfile unchanged), skipping build"
 elif ! nitro-cli build-enclave \
     --docker-uri slcl-nautilus:latest \
     --output-file "$EIF_PATH" \
@@ -354,6 +365,7 @@ PCR2=$(echo "$JSON_BLOCK" | jq -r '.Measurements.PCR2 // empty')
 # Rewrite build-output.json with clean JSON only
 echo "$JSON_BLOCK" > "$BUILD_OUT"
 
+echo "$DOCKERFILE_HASH" > "$HASH_FILE"
 ok "EIF built: $EIF_PATH"
 echo "    PCR0: ${PCR0:0:32}..."
 echo "    PCR1: ${PCR1:0:32}..."
@@ -442,7 +454,7 @@ ok "vsock bridge running on 127.0.0.1:3000"
 step "Health check (waiting up to 30s for enclave to serve /health)"
 HEALTH_OK=false
 for i in $(seq 1 30); do
-    if curl -fsS --max-time 2 http://localhost:3000/health >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 http://localhost:3000/health_check >/dev/null 2>&1; then
         HEALTH_OK=true
         break
     fi
