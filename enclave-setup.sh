@@ -117,33 +117,41 @@ else
     fi
 fi
 
-# On EC2, the Nitro hypervisor presents a virtio-vsock PCI device.  The correct
-# guest-side transport module is vmw_vsock_virtio_transport (generic virtio-vsock,
-# despite the VMware name).  It must be loaded for AF_VSOCK bind to succeed.
-# Remove any stale blacklist written by a previous script run.
+# Remove any stale blacklist from a previous script run.
 rm -f /etc/modprobe.d/blacklist-vmw-vsock.conf
 
-# Re-trigger udev PCI probing so the kernel auto-loads the driver for the
-# virtio-vsock device (handles kernels where the module name differs).
-udevadm trigger --subsystem-match=virtio 2>/dev/null || true
-udevadm settle --timeout=5 2>/dev/null || true
-
-# Also try explicit modprobe in case udev didn't pick it up (e.g. module was
-# previously unloaded).  Try both known module names across kernel versions.
+# The EC2 instance acts as the KVM-style *host* for Nitro Enclave sub-VMs.
+# The correct host-side vsock transport is vhost_vsock (not vmw_vsock_virtio_transport,
+# which is a guest-side driver that requires a virtio-vsock PCI device that Nitro
+# does not present as a standard PCI device).
+# Load: vsock core → vhost subsystem → vhost_vsock transport
 modprobe vsock 2>/dev/null || true
-modprobe vmw_vsock_virtio_transport 2>/dev/null || \
-    modprobe virtio_vsock 2>/dev/null || true
+modprobe vhost 2>/dev/null || true
+modprobe vhost_vsock 2>/dev/null || true
+# Fallback: virtio-vsock guest transport (on instances that do expose the device)
+modprobe vmw_vsock_virtio_transport 2>/dev/null || true
 
-# Verify a transport is registered (vsock users > 0 means a transport called
-# vsock_core_register(), which nitro-cli needs for AF_VSOCK bind to succeed).
-_vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
-if [[ "$_vsock_users" -gt 0 ]]; then
-    ok "vsock transport registered (users=${_vsock_users})"
+# Functional test: actually try to bind an AF_VSOCK socket.
+# lsmod refcounts only show module dependencies, not transport registration —
+# a module can be loaded but unbound (no device probe) and bind() still fails.
+if python3 - <<'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
+try:
+    s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 65432))
+    s.close(); sys.exit(0)
+except Exception as e:
+    sys.stderr.write(str(e)+'\n'); sys.exit(1)
+PYEOF
+then
+    ok "AF_VSOCK bind test passed — vsock transport is functional"
 else
-    warn "vsock has no registered transport — lsmod:"
-    lsmod | grep -E "vsock|nitro" >&2 || true
-    warn "Available vsock modules: $(find /lib/modules/$(uname -r) \
-        -name '*vsock*' 2>/dev/null | xargs -r -I{} basename {} .ko | tr '\n' ' ')"
+    warn "AF_VSOCK bind FAILED — vsock has no active transport"
+    warn "lsmod: $(lsmod | awk '/vsock|nitro/{printf \"%s(ref=%s) \",$1,$3}')"
+    warn "Devices: $(ls /dev/vhost-vsock /dev/vsock 2>/dev/null | tr '\n' ' '; echo)"
+    warn "Available modules: $(find /lib/modules/$(uname -r) -name '*vsock*' 2>/dev/null \
+        | xargs -r -I{} basename {} | sed 's/\.ko.*$//' | tr '\n' ' ')"
+    warn "Rebooting the instance restores the original vsock state automatically."
 fi
 
 # Load nitro_enclaves.  Remove any stale modprobe.d options file first so
@@ -480,22 +488,35 @@ if [[ "$ENCLAVE_DEBUG" == "true" ]]; then
     DEBUG_FLAG="--debug-mode"
 fi
 
-# Pre-flight: verify vsock transport is registered.  Without it, nitro-cli
-# cannot bind the boot heartbeat vsock socket and will fail with E36.
-_vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
-if [[ "$_vsock_users" -eq 0 ]]; then
-    warn "vsock transport NOT registered — attempting emergency reload"
-    udevadm trigger --subsystem-match=virtio 2>/dev/null || true
-    udevadm settle --timeout=5 2>/dev/null || true
-    modprobe vmw_vsock_virtio_transport 2>/dev/null || \
-        modprobe virtio_vsock 2>/dev/null || true
-    _vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
-    if [[ "$_vsock_users" -eq 0 ]]; then
-        warn "vsock still has no transport — E36 boot heartbeat failure is likely"
-        warn "Reboot the instance and re-run this script to restore vsock state"
-        lsmod | grep -E "vsock|nitro" >&2 || true
+# Pre-flight: verify AF_VSOCK bind actually works before launching.
+# Without a functional transport, nitro-cli fails at E36 boot heartbeat.
+if ! python3 - <<'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
+try:
+    s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 65432))
+    s.close(); sys.exit(0)
+except Exception: sys.exit(1)
+PYEOF
+then
+    warn "AF_VSOCK bind pre-flight FAILED — attempting emergency recovery"
+    modprobe vhost 2>/dev/null || true
+    modprobe vhost_vsock 2>/dev/null || true
+    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    if python3 - <<'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
+try:
+    s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 65432))
+    s.close(); sys.exit(0)
+except Exception: sys.exit(1)
+PYEOF
+    then
+        ok "AF_VSOCK bind recovered"
     else
-        ok "vsock transport recovered (users=${_vsock_users})"
+        warn "AF_VSOCK still failing — E36 boot heartbeat will likely fail"
+        warn "Devices: $(ls /dev/vhost-vsock /dev/vsock 2>/dev/null | tr '\n' ' '; echo)"
+        warn "Consider rebooting the instance to restore vsock state"
     fi
 fi
 
