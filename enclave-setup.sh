@@ -119,6 +119,10 @@ fi
 
 # Load vsock core first — nitro_enclaves registers its vsock transport against it.
 # Without vsock loaded before the enclave starts, AF_VSOCK connect() returns ENODEV.
+# Remove any stale modprobe.d options file first: if it contains a different ne_cpus
+# list than we're about to use, modprobe will pass both sets to the kernel and the
+# driver will fail on the stale (invalid) value before it even sees the new one.
+rm -f /etc/modprobe.d/nitro_enclaves.conf
 modprobe vsock 2>/dev/null || true
 modprobe nitro_enclaves 2>/dev/null || true
 
@@ -226,6 +230,15 @@ PYEOF
             fi
             sleep 0.5
         fi
+        # Re-online any CPUs the previous module load took offline.
+        # rmmod does not always restore CPU online state; if they're still
+        # offline when we modprobe, the driver returns EINVAL.
+        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+            _f="/sys/devices/system/cpu/cpu${_cpu}/online"
+            [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
+        done
+        # Remove stale conf so modprobe doesn't merge old ne_cpus with the new value.
+        rm -f /etc/modprobe.d/nitro_enclaves.conf
         if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
             dmesg | tail -10 >&2
             fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
