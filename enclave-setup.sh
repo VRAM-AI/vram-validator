@@ -299,9 +299,10 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 COPY slcl-nautilus /app/slcl-nautilus
 ENV PORT=3000
-# Shell wrapper: redirect stderr to /dev/console so tracing output and any
-# startup errors are visible on the nitro-cli debug console.
-ENTRYPOINT ["/bin/sh", "-c", "exec /app/slcl-nautilus 2>/dev/console"]
+# The Nitro Enclave kernel registers a dummy VGA console before ttyS0, so
+# /dev/console may alias to the VGA device (invisible in nitro-cli console).
+# Write to /dev/ttyS0 directly to guarantee output on the serial console.
+ENTRYPOINT ["/bin/sh", "-c", "echo '[nautilus] sh wrapper started' >/dev/ttyS0 2>/dev/null; exec /app/slcl-nautilus 2>/dev/ttyS0"]
 EOF
 
 docker build -t slcl-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v "^#" | tail -5
