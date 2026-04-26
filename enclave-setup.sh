@@ -409,6 +409,31 @@ if [[ -n "$RUNNING" ]]; then
         nitro-cli terminate-enclave --enclave-id "$eid" >/dev/null
         ok "Terminated $eid"
     done
+
+    # After terminate-enclave the nitro_enclaves module de-registers the old
+    # enclave's vsock CID.  A subsequent run-enclave does NOT re-register it
+    # reliably — the module must be reloaded so the new enclave's CID is
+    # visible to the host vsock transport before socat tries to connect.
+    # Only needed when we manage the module directly (no allocator service).
+    if [[ -z "$ALLOC_SVC" ]]; then
+        _RELOAD_CPUS="${CPU_LIST:-$(grep -oP '(?<=ne_cpus=)\S+' \
+            /etc/modprobe.d/nitro_enclaves.conf 2>/dev/null)}"
+        if [[ -n "$_RELOAD_CPUS" ]]; then
+            rmmod nitro_enclaves 2>/dev/null || true
+            rmmod vsock 2>/dev/null || true
+            sleep 0.3
+            modprobe vsock 2>/dev/null || true
+            for _cpu in $(echo "${_RELOAD_CPUS}" | tr ',' ' '); do
+                _f="/sys/devices/system/cpu/cpu${_cpu}/online"
+                [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
+            done
+            rm -f /etc/modprobe.d/nitro_enclaves.conf
+            modprobe nitro_enclaves ne_cpus="${_RELOAD_CPUS}"
+            echo "options nitro_enclaves ne_cpus=${_RELOAD_CPUS}" \
+                > /etc/modprobe.d/nitro_enclaves.conf
+            ok "vsock transport refreshed (ne_cpus=${_RELOAD_CPUS})"
+        fi
+    fi
 else
     ok "No existing enclaves"
 fi
