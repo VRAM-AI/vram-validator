@@ -238,6 +238,8 @@ PYEOF
 
     if [[ -n "$EXISTING_ENCLAVE" ]]; then
         ok "Enclave already running with CID ${ENCLAVE_CID} — CPU pool already configured"
+        echo "vm.nr_hugepages=${HUGE_PAGES}" \
+            > /etc/sysctl.d/20-nitro-enclaves.conf
     else
         if lsmod | grep -q "^nitro_enclaves"; then
             if ! rmmod nitro_enclaves 2>/dev/null; then
@@ -278,9 +280,6 @@ PYEOF
         echo "vm.nr_hugepages=${HUGE_PAGES}" \
             > /etc/sysctl.d/20-nitro-enclaves.conf
         ok "Pool settings saved (persists across reboots)"
-    else
-        echo "vm.nr_hugepages=${HUGE_PAGES}" \
-            > /etc/sysctl.d/20-nitro-enclaves.conf
     fi
 fi
 
