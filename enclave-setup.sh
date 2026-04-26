@@ -117,11 +117,21 @@ else
     fi
 fi
 
+# Ubuntu auto-loads VMware/virtio vsock transport modules (vmw_vsock_virtio_transport,
+# vhost_vsock) on EC2 because the hypervisor presents a virtio-vsock device.  These
+# modules register as the vsock transport and conflict with the Nitro Enclaves transport.
+# Blacklist them permanently and unload any already-running instances before touching vsock.
+cat > /etc/modprobe.d/blacklist-vmw-vsock.conf <<'BMEOF'
+blacklist vmw_vsock_virtio_transport
+blacklist vmw_vsock_virtio_transport_common
+blacklist vhost_vsock
+BMEOF
+for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
+    lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
+done
+
 # Load vsock core first — nitro_enclaves registers its vsock transport against it.
-# Without vsock loaded before the enclave starts, AF_VSOCK connect() returns ENODEV.
-# Remove any stale modprobe.d options file first: if it contains a different ne_cpus
-# list than we're about to use, modprobe will pass both sets to the kernel and the
-# driver will fail on the stale (invalid) value before it even sees the new one.
+# Remove any stale modprobe.d options file first.
 rm -f /etc/modprobe.d/nitro_enclaves.conf
 modprobe vsock 2>/dev/null || true
 modprobe nitro_enclaves 2>/dev/null || true
@@ -202,14 +212,19 @@ for line in out.splitlines():
     cpu_id, core_id = int(fields[0]), int(fields[1])
     core_to_cpus[core_id].append(cpu_id)
 
-# Sort cores descending (prefer higher-numbered cores, avoiding core 0)
+# Sort cores descending (prefer higher-numbered cores, avoiding core 0).
+# Skip any physical core that contains CPU 0 — it handles IPIs/IRQs and
+# cannot be in the enclave pool (the driver returns EINVAL).
 sorted_cores = sorted(core_to_cpus.keys(), reverse=True)
 
 pool = []
 for core in sorted_cores:
     if len(pool) >= enclave_cpus:
         break
-    pool.extend(core_to_cpus[core])
+    cpus = core_to_cpus[core]
+    if 0 in cpus:
+        continue  # boot CPU cannot be in enclave pool
+    pool.extend(cpus)
 
 print(','.join(str(c) for c in sorted(pool)))
 PYEOF
@@ -231,9 +246,11 @@ PYEOF
             sleep 0.5
         fi
         # After unloading nitro_enclaves, also cycle vsock so the kernel's
-        # vsock transport table is reset. Without this, re-loading
-        # nitro_enclaves may silently fail to re-register its transport and
-        # every subsequent AF_VSOCK connect returns ENODEV.
+        # vsock transport table is reset.  Unload VMware vsock modules first —
+        # they hold a reference on vsock and block rmmod.
+        for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
+            lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
+        done
         rmmod vsock 2>/dev/null || true
         sleep 0.3
         modprobe vsock 2>/dev/null || true
@@ -431,6 +448,10 @@ if [[ -n "$RUNNING" ]]; then
             /etc/modprobe.d/nitro_enclaves.conf 2>/dev/null)}"
         if [[ -n "$_RELOAD_CPUS" ]]; then
             rmmod nitro_enclaves 2>/dev/null || true
+            # Unload VMware vsock modules before cycling vsock (they hold a ref)
+            for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
+                lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
+            done
             rmmod vsock 2>/dev/null || true
             sleep 0.3
             modprobe vsock 2>/dev/null || true
