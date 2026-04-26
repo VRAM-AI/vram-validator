@@ -117,23 +117,20 @@ else
     fi
 fi
 
-# Ubuntu auto-loads VMware/virtio vsock transport modules (vmw_vsock_virtio_transport,
-# vhost_vsock) on EC2 because the hypervisor presents a virtio-vsock device.  These
-# modules register as the vsock transport and conflict with the Nitro Enclaves transport.
-# Blacklist them permanently and unload any already-running instances before touching vsock.
-cat > /etc/modprobe.d/blacklist-vmw-vsock.conf <<'BMEOF'
-blacklist vmw_vsock_virtio_transport
-blacklist vmw_vsock_virtio_transport_common
-blacklist vhost_vsock
-BMEOF
-for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
-    lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
-done
+# On EC2, the Nitro hypervisor presents a virtio-vsock device.  The kernel auto-loads
+# vmw_vsock_virtio_transport (the generic virtio-vsock transport, despite its name).
+# This IS the vsock transport that nitro-cli uses when connecting to enclave CIDs.
+# We must NOT remove it.  Remove any stale blacklist from a previous script run.
+rm -f /etc/modprobe.d/blacklist-vmw-vsock.conf
 
-# Load vsock core first — nitro_enclaves registers its vsock transport against it.
-# Remove any stale modprobe.d options file first.
-rm -f /etc/modprobe.d/nitro_enclaves.conf
+# Ensure the virtio-vsock transport and vsock core are loaded so AF_VSOCK sockets work.
 modprobe vsock 2>/dev/null || true
+modprobe vmw_vsock_virtio_transport_common 2>/dev/null || true
+modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+
+# Load nitro_enclaves.  Remove any stale modprobe.d options file first so
+# a previous ne_cpus value doesn't interfere.
+rm -f /etc/modprobe.d/nitro_enclaves.conf
 modprobe nitro_enclaves 2>/dev/null || true
 
 # Create the enclave sockets directory early — describe-enclaves needs it.
@@ -247,15 +244,7 @@ PYEOF
             fi
             sleep 0.5
         fi
-        # After unloading nitro_enclaves, also cycle vsock so the kernel's
-        # vsock transport table is reset.  Unload VMware vsock modules first —
-        # they hold a reference on vsock and block rmmod.
-        for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
-            lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
-        done
-        rmmod vsock 2>/dev/null || true
         sleep 0.3
-        modprobe vsock 2>/dev/null || true
         # Re-online any CPUs the previous module load took offline.
         # rmmod does not always restore CPU online state; if they're still
         # offline when we modprobe, the driver returns EINVAL.
@@ -434,8 +423,9 @@ if [[ -n "$RUNNING" ]]; then
 
     # After terminate-enclave the nitro_enclaves module de-registers the old
     # enclave's vsock CID.  A subsequent run-enclave does NOT re-register it
-    # reliably — the module must be reloaded so the new enclave's CID is
-    # visible to the host vsock transport before socat tries to connect.
+    # reliably — reload nitro_enclaves so the new enclave's CID is visible to
+    # the host vsock transport (vmw_vsock_virtio_transport, the EC2 virtio vsock)
+    # before socat tries to connect.
     # Only needed when we manage the module directly (no allocator service).
     if [[ -z "$ALLOC_SVC" ]]; then
         # Read the ACTUAL ne_cpus the kernel has loaded — sysfs is authoritative.
@@ -447,13 +437,7 @@ if [[ -n "$RUNNING" ]]; then
             /etc/modprobe.d/nitro_enclaves.conf 2>/dev/null)}"
         if [[ -n "$_RELOAD_CPUS" ]]; then
             rmmod nitro_enclaves 2>/dev/null || true
-            # Unload VMware vsock modules before cycling vsock (they hold a ref)
-            for _vmw in vhost_vsock vmw_vsock_virtio_transport vmw_vsock_virtio_transport_common; do
-                lsmod | grep -q "^${_vmw}" && rmmod "${_vmw}" 2>/dev/null || true
-            done
-            rmmod vsock 2>/dev/null || true
             sleep 0.3
-            modprobe vsock 2>/dev/null || true
             for _cpu in $(echo "${_RELOAD_CPUS}" | tr ',' ' '); do
                 _f="/sys/devices/system/cpu/cpu${_cpu}/online"
                 [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
