@@ -117,16 +117,34 @@ else
     fi
 fi
 
-# On EC2, the Nitro hypervisor presents a virtio-vsock device.  The kernel auto-loads
-# vmw_vsock_virtio_transport (the generic virtio-vsock transport, despite its name).
-# This IS the vsock transport that nitro-cli uses when connecting to enclave CIDs.
-# We must NOT remove it.  Remove any stale blacklist from a previous script run.
+# On EC2, the Nitro hypervisor presents a virtio-vsock PCI device.  The correct
+# guest-side transport module is vmw_vsock_virtio_transport (generic virtio-vsock,
+# despite the VMware name).  It must be loaded for AF_VSOCK bind to succeed.
+# Remove any stale blacklist written by a previous script run.
 rm -f /etc/modprobe.d/blacklist-vmw-vsock.conf
 
-# Ensure the virtio-vsock transport and vsock core are loaded so AF_VSOCK sockets work.
+# Re-trigger udev PCI probing so the kernel auto-loads the driver for the
+# virtio-vsock device (handles kernels where the module name differs).
+udevadm trigger --subsystem-match=virtio 2>/dev/null || true
+udevadm settle --timeout=5 2>/dev/null || true
+
+# Also try explicit modprobe in case udev didn't pick it up (e.g. module was
+# previously unloaded).  Try both known module names across kernel versions.
 modprobe vsock 2>/dev/null || true
-modprobe vmw_vsock_virtio_transport_common 2>/dev/null || true
-modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+modprobe vmw_vsock_virtio_transport 2>/dev/null || \
+    modprobe virtio_vsock 2>/dev/null || true
+
+# Verify a transport is registered (vsock users > 0 means a transport called
+# vsock_core_register(), which nitro-cli needs for AF_VSOCK bind to succeed).
+_vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
+if [[ "$_vsock_users" -gt 0 ]]; then
+    ok "vsock transport registered (users=${_vsock_users})"
+else
+    warn "vsock has no registered transport — lsmod:"
+    lsmod | grep -E "vsock|nitro" >&2 || true
+    warn "Available vsock modules: $(find /lib/modules/$(uname -r) \
+        -name '*vsock*' 2>/dev/null | xargs -r -I{} basename {} .ko | tr '\n' ' ')"
+fi
 
 # Load nitro_enclaves.  Remove any stale modprobe.d options file first so
 # a previous ne_cpus value doesn't interfere.
@@ -460,6 +478,25 @@ step "Starting enclave (CID=${ENCLAVE_CID})"
 DEBUG_FLAG=""
 if [[ "$ENCLAVE_DEBUG" == "true" ]]; then
     DEBUG_FLAG="--debug-mode"
+fi
+
+# Pre-flight: verify vsock transport is registered.  Without it, nitro-cli
+# cannot bind the boot heartbeat vsock socket and will fail with E36.
+_vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
+if [[ "$_vsock_users" -eq 0 ]]; then
+    warn "vsock transport NOT registered — attempting emergency reload"
+    udevadm trigger --subsystem-match=virtio 2>/dev/null || true
+    udevadm settle --timeout=5 2>/dev/null || true
+    modprobe vmw_vsock_virtio_transport 2>/dev/null || \
+        modprobe virtio_vsock 2>/dev/null || true
+    _vsock_users=$(awk '/^vsock /{print $3}' /proc/modules 2>/dev/null || echo 0)
+    if [[ "$_vsock_users" -eq 0 ]]; then
+        warn "vsock still has no transport — E36 boot heartbeat failure is likely"
+        warn "Reboot the instance and re-run this script to restore vsock state"
+        lsmod | grep -E "vsock|nitro" >&2 || true
+    else
+        ok "vsock transport recovered (users=${_vsock_users})"
+    fi
 fi
 
 nitro-cli run-enclave \
