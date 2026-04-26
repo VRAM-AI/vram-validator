@@ -120,16 +120,31 @@ fi
 # Remove any stale blacklist from a previous script run.
 rm -f /etc/modprobe.d/blacklist-vmw-vsock.conf
 
-# The EC2 instance acts as the KVM-style *host* for Nitro Enclave sub-VMs.
-# The correct host-side vsock transport is vhost_vsock (not vmw_vsock_virtio_transport,
-# which is a guest-side driver that requires a virtio-vsock PCI device that Nitro
-# does not present as a standard PCI device).
-# Load: vsock core → vhost subsystem → vhost_vsock transport
+# On EC2 Nitro, the virtio-vsock device is presented by the hypervisor.
+# The guest driver (vmw_vsock_virtio_transport) must be both LOADED and BOUND
+# to the device for the transport to register — loading the module alone is not
+# enough.  The driver's refcount in lsmod will be 0 if it loaded without a
+# device probe.  We explicitly trigger a virtio bus scan after loading so the
+# kernel binds the driver to the vsock device.
 modprobe vsock 2>/dev/null || true
 modprobe vhost 2>/dev/null || true
 modprobe vhost_vsock 2>/dev/null || true
-# Fallback: virtio-vsock guest transport (on instances that do expose the device)
 modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+
+# Explicitly bind vmw_vsock_virtio_transport to the virtio-vsock device (device
+# ID 19 = 0x0013) if it exists but hasn't been auto-probed (e.g. after manual
+# module reload).  Writing the device name to the driver's bind sysfs file
+# triggers probe() and vsock_core_register() without needing udevadm.
+for _vdev in /sys/bus/virtio/devices/*/; do
+    _id=$(printf '%d' "$(cat "${_vdev}device" 2>/dev/null || echo 0)" 2>/dev/null || echo 0)
+    if [[ "$_id" -eq 19 ]]; then
+        _devname=$(basename "$_vdev")
+        # Bind succeeds silently; EBUSY means already bound (both are fine).
+        echo "$_devname" > /sys/bus/virtio/drivers/vmw_vsock_virtio_transport/bind 2>/dev/null || true
+        ok "Bound vmw_vsock_virtio_transport to virtio vsock device $_devname"
+        break
+    fi
+done
 
 # Functional test: actually try to bind an AF_VSOCK socket.
 # lsmod refcounts only show module dependencies, not transport registration —
@@ -146,12 +161,10 @@ PYEOF
 then
     ok "AF_VSOCK bind test passed — vsock transport is functional"
 else
-    warn "AF_VSOCK bind FAILED — vsock has no active transport"
+    warn "AF_VSOCK bind FAILED — vsock transport not registered"
     warn "lsmod: $(lsmod | awk '/vsock|nitro/{printf \"%s(ref=%s) \",$1,$3}')"
-    warn "Devices: $(ls /dev/vhost-vsock /dev/vsock 2>/dev/null | tr '\n' ' '; echo)"
-    warn "Available modules: $(find /lib/modules/$(uname -r) -name '*vsock*' 2>/dev/null \
-        | xargs -r -I{} basename {} | sed 's/\.ko.*$//' | tr '\n' ' ')"
-    warn "Rebooting the instance restores the original vsock state automatically."
+    warn "virtio devices: $(ls /sys/bus/virtio/devices/ 2>/dev/null | tr '\n' ' ')"
+    warn "Rebooting the instance will restore the original vsock state."
 fi
 
 # Load nitro_enclaves.  Remove any stale modprobe.d options file first so
