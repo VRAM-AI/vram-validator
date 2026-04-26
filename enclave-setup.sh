@@ -251,14 +251,20 @@ PYEOF
             fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
         fi
         ok "nitro_enclaves loaded with ne_cpus=${CPU_LIST}"
-    fi
 
-    # 4. Persist across reboots
-    echo "options nitro_enclaves ne_cpus=${CPU_LIST}" \
-        > /etc/modprobe.d/nitro_enclaves.conf
-    echo "vm.nr_hugepages=${HUGE_PAGES}" \
-        > /etc/sysctl.d/20-nitro-enclaves.conf
-    ok "Pool settings saved (persists across reboots)"
+        # 4. Persist across reboots (only when we actually loaded the module;
+        #    do NOT overwrite the conf in the "already running" path — the
+        #    enclave keeps CPUs offline so lscpu sees a truncated topology,
+        #    causing the Python to compute a wrong CPU_LIST including CPU 0).
+        echo "options nitro_enclaves ne_cpus=${CPU_LIST}" \
+            > /etc/modprobe.d/nitro_enclaves.conf
+        echo "vm.nr_hugepages=${HUGE_PAGES}" \
+            > /etc/sysctl.d/20-nitro-enclaves.conf
+        ok "Pool settings saved (persists across reboots)"
+    else
+        echo "vm.nr_hugepages=${HUGE_PAGES}" \
+            > /etc/sysctl.d/20-nitro-enclaves.conf
+    fi
 fi
 
 # ─── 5. Install vram-cli (on-chain registration tool) ───────────────────────
@@ -416,7 +422,12 @@ if [[ -n "$RUNNING" ]]; then
     # visible to the host vsock transport before socat tries to connect.
     # Only needed when we manage the module directly (no allocator service).
     if [[ -z "$ALLOC_SVC" ]]; then
-        _RELOAD_CPUS="${CPU_LIST:-$(grep -oP '(?<=ne_cpus=)\S+' \
+        # Read the ACTUAL ne_cpus the kernel has loaded — sysfs is authoritative.
+        # The enclave keeps its CPUs offline, so lscpu shows a truncated topology
+        # and CPU_LIST may include CPU 0 (invalid).  Prefer sysfs, then the conf
+        # file written by a previous successful module load.
+        _RELOAD_CPUS="$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true)"
+        _RELOAD_CPUS="${_RELOAD_CPUS:-$(grep -oP '(?<=ne_cpus=)\S+' \
             /etc/modprobe.d/nitro_enclaves.conf 2>/dev/null)}"
         if [[ -n "$_RELOAD_CPUS" ]]; then
             rmmod nitro_enclaves 2>/dev/null || true
