@@ -372,16 +372,18 @@ step "Building Enclave Image File (EIF)"
 mkdir -p "$INSTALL_DIR" /var/log/nitro_enclaves
 EIF_PATH="$INSTALL_DIR/slcl-nautilus.eif"
 BUILD_OUT="$INSTALL_DIR/build-output.json"
-HASH_FILE="$INSTALL_DIR/dockerfile.sha256"
+HASH_FILE="$INSTALL_DIR/image.sha256"
 
-# Hash the Dockerfile so the EIF is rebuilt whenever the image changes
-DOCKERFILE_HASH=$(sha256sum "$BUILD_DIR/Dockerfile" | cut -d' ' -f1)
+# Hash both the Dockerfile AND the binary — the EIF must be rebuilt whenever
+# either changes (binary changes don't alter the Dockerfile hash).
+IMAGE_HASH=$( (sha256sum "$BUILD_DIR/Dockerfile"; sha256sum "$BUILD_DIR/slcl-nautilus") \
+    | sha256sum | cut -d' ' -f1)
 CACHED_HASH=$(cat "$HASH_FILE" 2>/dev/null || echo "")
 
 if [[ -f "$EIF_PATH" ]] && [[ -f "$BUILD_OUT" ]] && \
    grep -q 'PCR0' "$BUILD_OUT" 2>/dev/null && \
-   [[ "$DOCKERFILE_HASH" == "$CACHED_HASH" ]]; then
-    ok "EIF already exists (Dockerfile unchanged), skipping build"
+   [[ "$IMAGE_HASH" == "$CACHED_HASH" ]]; then
+    ok "EIF already exists (Dockerfile + binary unchanged), skipping build"
 elif ! nitro-cli build-enclave \
     --docker-uri slcl-nautilus:latest \
     --output-file "$EIF_PATH" \
@@ -406,7 +408,7 @@ PCR2=$(echo "$JSON_BLOCK" | jq -r '.Measurements.PCR2 // empty')
 # Rewrite build-output.json with clean JSON only
 echo "$JSON_BLOCK" > "$BUILD_OUT"
 
-echo "$DOCKERFILE_HASH" > "$HASH_FILE"
+echo "$IMAGE_HASH" > "$HASH_FILE"
 ok "EIF built: $EIF_PATH"
 echo "    PCR0: ${PCR0:0:32}..."
 echo "    PCR1: ${PCR1:0:32}..."
