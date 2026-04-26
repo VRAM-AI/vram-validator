@@ -230,6 +230,13 @@ PYEOF
             fi
             sleep 0.5
         fi
+        # After unloading nitro_enclaves, also cycle vsock so the kernel's
+        # vsock transport table is reset. Without this, re-loading
+        # nitro_enclaves may silently fail to re-register its transport and
+        # every subsequent AF_VSOCK connect returns ENODEV.
+        rmmod vsock 2>/dev/null || true
+        sleep 0.3
+        modprobe vsock 2>/dev/null || true
         # Re-online any CPUs the previous module load took offline.
         # rmmod does not always restore CPU online state; if they're still
         # offline when we modprobe, the driver returns EINVAL.
@@ -288,10 +295,13 @@ step "Building Docker image for EIF"
 # The host-side socat bridges: TCP-LISTEN:3000 → VSOCK-CONNECT:CID:3000.
 # FROM scratch keeps the EIF minimal and the PCR measurements stable.
 cat > "$BUILD_DIR/Dockerfile" <<'EOF'
-FROM scratch
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
 COPY slcl-nautilus /app/slcl-nautilus
 ENV PORT=3000
-ENTRYPOINT ["/app/slcl-nautilus"]
+# Shell wrapper: redirect stderr to /dev/console so tracing output and any
+# startup errors are visible on the nitro-cli debug console.
+ENTRYPOINT ["/bin/sh", "-c", "exec /app/slcl-nautilus 2>/dev/console"]
 EOF
 
 docker build -t slcl-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v "^#" | tail -5
