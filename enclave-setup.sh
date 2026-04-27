@@ -228,25 +228,35 @@ else
     #    We walk CPUs from the end (avoiding CPU 0 which handles IRQs), read
     #    each CPU's thread_siblings_list, and accumulate whole cores until we
     #    have enough vCPUs.
+    # Bring all CPUs back online before topology scan — a previous nitro_enclaves
+    # load may have left pool CPUs offline, which causes nproc --all to
+    # undercount and skews the sysfs core_id mapping (core_id exists but the
+    # CPU won't be given to the new pool if it's still marked offline).
+    for _ocpu in /sys/devices/system/cpu/cpu[0-9]*/online; do
+        [[ -f "$_ocpu" ]] && echo 1 > "$_ocpu" 2>/dev/null || true
+    done
+
     TOTAL_CPUS=$(nproc --all)
     if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
         fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
     fi
-    # Use lscpu -p to build a core→cpu mapping (reliable on all kernels/hypervisors)
+    # Build core→cpu mapping from sysfs topology — works even when CPUs are
+    # offline (lscpu -p silently omits offline CPUs on kernel 6.17+).
     CPU_LIST=$(python3 - "${ENCLAVE_CPU_COUNT}" <<'PYEOF'
-import subprocess, sys, collections
+import os, sys, collections
 
 enclave_cpus = int(sys.argv[1])
+cpu_dir = '/sys/devices/system/cpu'
 
-# lscpu -p outputs lines like: CPU,Core,Socket,... (skip comment lines)
-out = subprocess.check_output(['lscpu', '-p'], text=True)
 core_to_cpus = collections.defaultdict(list)
-for line in out.splitlines():
-    if line.startswith('#') or not line.strip():
+for ent in sorted(os.listdir(cpu_dir)):
+    if not ent.startswith('cpu') or not ent[3:].isdigit():
         continue
-    fields = line.split(',')
-    cpu_id, core_id = int(fields[0]), int(fields[1])
-    core_to_cpus[core_id].append(cpu_id)
+    cpu_id = int(ent[3:])
+    core_path = os.path.join(cpu_dir, ent, 'topology', 'core_id')
+    if os.path.exists(core_path):
+        core_id = int(open(core_path).read().strip())
+        core_to_cpus[core_id].append(cpu_id)
 
 # Sort cores descending (prefer higher-numbered cores, avoiding core 0).
 # Skip any physical core that contains CPU 0 — it handles IPIs/IRQs and
@@ -265,6 +275,9 @@ for core in sorted_cores:
 print(','.join(str(c) for c in sorted(pool)))
 PYEOF
 )
+    if [[ -z "$CPU_LIST" ]]; then
+        fatal "No eligible CPUs found for enclave pool (need ${ENCLAVE_CPU_COUNT}, host has ${TOTAL_CPUS}). Offline CPUs may still be reserved — try rebooting."
+    fi
     ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total, aligned to physical cores)"
 
     # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool.
