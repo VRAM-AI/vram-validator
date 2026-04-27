@@ -575,8 +575,17 @@ fi
 if [[ -z "$ENCLAVE_ID" ]]; then
     warn "run-enclave output:"
     cat /tmp/run-enclave.json
-    ERRLOG=$(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -1)
-    [[ -n "$ERRLOG" ]] && cat "$ERRLOG"
+    warn "--- nitro_enclaves kernel messages ---"
+    dmesg | grep -i "nitro\|enclave\|vsock" | tail -20 || true
+    warn "--- nitro error logs ---"
+    for _elog in $(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -5); do
+        warn "  $_elog:"
+        cat "$_elog" 2>/dev/null || true
+    done
+    # Delete the EIF cache so the next run forces a fresh build — the cached
+    # EIF may have been built from a stale binary or with a different Dockerfile.
+    rm -f "$HASH_FILE"
+    warn "EIF cache cleared — next run will rebuild the enclave image"
     fatal "Failed to start enclave — re-run with ENCLAVE_DEBUG=true for console output"
 fi
 ok "Enclave started: $ENCLAVE_ID"
