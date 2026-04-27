@@ -228,27 +228,58 @@ else
     ACTUAL_HP=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
     ok "Huge pages: ${ACTUAL_HP} × 2 MiB = $((ACTUAL_HP * 2)) MiB reserved"
 
-    # 2. Choose which CPUs to dedicate to the enclave pool.
-    #    The driver requires ALL hyperthreads of a physical core to be in the
-    #    pool together — you cannot mix threads from different cores.
+    # 2. Determine the target CPU list for the enclave pool.
     #
-    # IMPORTANT: do NOT re-online pool CPUs before the topology scan.
-    # The sysfs core_id files exist for offline CPUs, so the scan works fine.
-    # Re-onlining first would undo the pool state and force an unnecessary
-    # rmmod+modprobe that disrupts the host vsock transport (causing E36).
-    # nproc --all counts installed CPUs regardless of online state.
-    TOTAL_CPUS=$(nproc --all)
-    if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
-        fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
-    fi
-    # Build core→cpu mapping from sysfs topology — works even when CPUs are
-    # offline (lscpu -p silently omits offline CPUs on kernel 6.17+).
-    CPU_LIST=$(python3 - "${ENCLAVE_CPU_COUNT}" <<'PYEOF'
-import os, sys, collections
+    # Key constraint: on kernel 6.17, offline CPUs lose their sysfs
+    # topology/core_id files. A live topology scan therefore fails when the
+    # pool CPUs are already offline (all topology info gone → empty CPU_LIST).
+    # Re-onlining the pool CPUs to do the scan would then undo the pool state
+    # and force an unnecessary rmmod+modprobe, which disrupts vsock (→ E36).
+    #
+    # Strategy:
+    #   A) If nitro_enclaves is loaded and we have a saved ne_cpus config that
+    #      satisfies ENCLAVE_CPU_COUNT, AND those CPUs are currently offline
+    #      (in pool) → use saved config, skip topology scan and reload entirely.
+    #   B) Otherwise, re-online all CPUs (they must be online for the scan to
+    #      see their topology), run the scan, then reload the module.
 
+    CPU_LIST=""
+    _NEED_RELOAD=true
+
+    # (A) Try to reuse the existing pool without touching vsock.
+    SAVED_CPU_LIST=$(sed -n 's/.*ne_cpus=\([0-9,]*\).*/\1/p' \
+        /etc/modprobe.d/nitro_enclaves.conf 2>/dev/null || echo "")
+    SAVED_COUNT=$(echo "$SAVED_CPU_LIST" | tr ',' '\n' | grep -c '[0-9]' 2>/dev/null || echo 0)
+
+    if lsmod | grep -q "^nitro_enclaves" && \
+       [[ -n "$SAVED_CPU_LIST" ]] && \
+       [[ "$SAVED_COUNT" -ge "$ENCLAVE_CPU_COUNT" ]]; then
+        _all_offline=true
+        for _cpu in $(echo "$SAVED_CPU_LIST" | tr ',' ' '); do
+            _state=$(cat "/sys/devices/system/cpu/cpu${_cpu}/online" 2>/dev/null || echo "1")
+            [[ "$_state" != "0" ]] && _all_offline=false && break
+        done
+        if $_all_offline; then
+            CPU_LIST="$SAVED_CPU_LIST"
+            _NEED_RELOAD=false
+            ok "CPU pool already active (${CPU_LIST} offline) — skipping module reload"
+        fi
+    fi
+
+    # (B) Fresh scan: re-online all CPUs so topology files are accessible.
+    if [[ -z "$CPU_LIST" ]]; then
+        for _ocpu in /sys/devices/system/cpu/cpu[0-9]*/online; do
+            [[ -f "$_ocpu" ]] && echo 1 > "$_ocpu" 2>/dev/null || true
+        done
+        sleep 0.2
+        TOTAL_CPUS=$(nproc --all)
+        if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
+            fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
+        fi
+        CPU_LIST=$(python3 - "${ENCLAVE_CPU_COUNT}" <<'PYEOF'
+import os, sys, collections
 enclave_cpus = int(sys.argv[1])
 cpu_dir = '/sys/devices/system/cpu'
-
 core_to_cpus = collections.defaultdict(list)
 for ent in sorted(os.listdir(cpu_dir)):
     if not ent.startswith('cpu') or not ent[3:].isdigit():
@@ -258,64 +289,51 @@ for ent in sorted(os.listdir(cpu_dir)):
     if os.path.exists(core_path):
         core_id = int(open(core_path).read().strip())
         core_to_cpus[core_id].append(cpu_id)
-
-# Sort cores descending (prefer higher-numbered cores, avoiding core 0).
-# Skip any physical core that contains CPU 0 — it handles IPIs/IRQs and
-# cannot be in the enclave pool (the driver returns EINVAL).
 sorted_cores = sorted(core_to_cpus.keys(), reverse=True)
-
 pool = []
 for core in sorted_cores:
     if len(pool) >= enclave_cpus:
         break
     cpus = core_to_cpus[core]
     if 0 in cpus:
-        continue  # boot CPU cannot be in enclave pool
+        continue
     pool.extend(cpus)
-
 print(','.join(str(c) for c in sorted(pool)))
 PYEOF
-)
-    if [[ -z "$CPU_LIST" ]]; then
-        fatal "No eligible CPUs found for enclave pool (need ${ENCLAVE_CPU_COUNT}, host has ${TOTAL_CPUS}). Offline CPUs may still be reserved — try rebooting."
+        )
+        if [[ -z "$CPU_LIST" ]]; then
+            fatal "No eligible CPUs found for enclave pool (need ${ENCLAVE_CPU_COUNT}, host has ${TOTAL_CPUS})."
+        fi
+        ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total)"
     fi
-    ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total, aligned to physical cores)"
 
-    # 3. Configure the CPU pool in the nitro_enclaves kernel module.
-    #
-    # IMPORTANT: rmmod + modprobe nitro_enclaves disrupts the host vsock
-    # transport state, causing the enclave heartbeat bind to fail (E36).
-    # We avoid the reload entirely when the desired pool is already active
-    # (i.e. the desired CPUs are already offline/in-pool).
+    # 3. Load / reload nitro_enclaves with the chosen CPU pool (if needed).
     EXISTING_ENCLAVE=$(nitro-cli describe-enclaves 2>/dev/null | \
         jq -r ".[] | select(.EnclaveCID == ${ENCLAVE_CID}) | .EnclaveID" 2>/dev/null || echo "")
 
     if [[ -n "$EXISTING_ENCLAVE" ]]; then
-        ok "Enclave already running with CID ${ENCLAVE_CID} — CPU pool already configured"
+        ok "Enclave already running with CID ${ENCLAVE_CID} — pool already configured"
         echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
 
-    elif lsmod | grep -q "^nitro_enclaves"; then
-        # Module already loaded — check if all desired CPUs are offline (in pool).
-        _pool_ok=true
+    elif [[ "$_NEED_RELOAD" == "false" ]]; then
+        # Pool is already active — nothing to do for the module.
+        echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
+
+    else
+        # Need to (re)load the module.  CPUs must be online before modprobe.
         for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
             _f="/sys/devices/system/cpu/cpu${_cpu}/online"
-            _state=$(cat "$_f" 2>/dev/null || echo "1")
-            [[ "$_state" != "0" ]] && _pool_ok=false && break
-        done
-
-        if $_pool_ok; then
-            ok "nitro_enclaves already loaded with CPUs ${CPU_LIST} in pool — skipping reload"
-        else
-            # Pool is wrong — must reload. Bring CPUs online first (rmmod exit
-            # may not re-online them), then rmmod, then re-online, then modprobe.
-            for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
-                echo 1 > "/sys/devices/system/cpu/cpu${_cpu}/online" 2>/dev/null || true
+            for _t in $(seq 1 20); do
+                [[ "$(cat "$_f" 2>/dev/null)" == "1" ]] && break
+                echo 1 > "$_f" 2>/dev/null || true; sleep 0.1
             done
+        done
+        if lsmod | grep -q "^nitro_enclaves"; then
             if ! rmmod nitro_enclaves 2>/dev/null; then
                 fatal "nitro_enclaves in use — terminate existing enclaves first: sudo nitro-cli terminate-enclave --all"
             fi
             sleep 1
-            # Re-online with retry — rmmod may not re-online CPUs on kernel 6.17.
+            # rmmod may not re-online CPUs on kernel 6.17 — retry explicitly.
             for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
                 _f="/sys/devices/system/cpu/cpu${_cpu}/online"
                 for _t in $(seq 1 20); do
@@ -325,23 +343,7 @@ PYEOF
                 [[ "$(cat "$_f" 2>/dev/null)" != "1" ]] && \
                     fatal "CPU ${_cpu} still offline after rmmod — reboot the instance to reset CPU state"
             done
-            rm -f /etc/modprobe.d/nitro_enclaves.conf
-            if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
-                dmesg | tail -10 >&2
-                fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
-            fi
-            ok "nitro_enclaves reloaded with ne_cpus=${CPU_LIST}"
-            echo "options nitro_enclaves ne_cpus=${CPU_LIST}" > /etc/modprobe.d/nitro_enclaves.conf
-            echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
-            ok "Pool settings saved (persists across reboots)"
         fi
-
-    else
-        # Fresh load — bring pool CPUs online before modprobe (they may be
-        # offline from a previous session's manual offline or /etc/modprobe.d).
-        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
-            echo 1 > "/sys/devices/system/cpu/cpu${_cpu}/online" 2>/dev/null || true
-        done
         rm -f /etc/modprobe.d/nitro_enclaves.conf
         if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
             dmesg | tail -10 >&2
@@ -351,16 +353,14 @@ PYEOF
         echo "options nitro_enclaves ne_cpus=${CPU_LIST}" > /etc/modprobe.d/nitro_enclaves.conf
         echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
         ok "Pool settings saved (persists across reboots)"
-    fi
 
-    # After any pool change (or on fresh load), reload vhost_vsock so the
-    # vsock transport is in a clean state before run-enclave.
-    # Loading nitro_enclaves can disrupt host vsock transport registration.
-    if lsmod | grep -q "^vhost_vsock"; then
-        rmmod vhost_vsock 2>/dev/null || true
-        sleep 0.3
-        modprobe vhost_vsock 2>/dev/null || true
-        sleep 0.5
+        # Reload vhost_vsock after nitro_enclaves load to restore clean vsock state.
+        if lsmod | grep -q "^vhost_vsock"; then
+            rmmod vhost_vsock 2>/dev/null || true
+            sleep 0.3
+            modprobe vhost_vsock 2>/dev/null || true
+            sleep 0.5
+        fi
     fi
 fi
 
