@@ -101,20 +101,26 @@ ok "Docker running"
 
 # ─── 3. Install nitro-cli ───────────────────────────────────────────────────
 step "Installing nitro-cli"
-if command -v nitro-cli >/dev/null 2>&1; then
-    ok "nitro-cli already installed: $(nitro-cli --version 2>&1 | head -1)"
+# Always prefer the apt package — it is compiled for Ubuntu and includes the
+# allocator service + proper udev rules.  The downloaded binary (v1.4.4) has
+# a confirmed vsock bind failure in its enclave-proc daemon on kernel 6.17+.
+# If apt succeeds, remove any previously-downloaded /usr/local/bin/nitro-cli
+# so the apt binary (at /usr/bin/nitro-cli) is found first on PATH.
+_NITRO_FROM_APT=false
+if apt-get install -y -qq aws-nitro-enclaves-cli 2>/dev/null; then
+    apt-get install -y -qq aws-nitro-enclaves-cli-devel 2>/dev/null || true
+    # Remove the manually-downloaded copy so the apt version takes precedence
+    [[ -f /usr/local/bin/nitro-cli ]] && rm -f /usr/local/bin/nitro-cli
+    _NITRO_FROM_APT=true
+    ok "nitro-cli installed via apt: $(nitro-cli --version 2>&1 | head -1)"
+elif command -v nitro-cli >/dev/null 2>&1; then
+    ok "nitro-cli already installed (binary): $(nitro-cli --version 2>&1 | head -1)"
 else
-    # Try the apt package first (installs allocator service too); -devel is optional
-    if apt-get install -y -qq aws-nitro-enclaves-cli 2>/dev/null; then
-        apt-get install -y -qq aws-nitro-enclaves-cli-devel 2>/dev/null || true
-        ok "Installed aws-nitro-enclaves-cli via apt"
-    else
-        warn "aws-nitro-enclaves-cli not in apt (normal on Ubuntu 24.04) — using release binary"
-        curl -fsSL -o /usr/local/bin/nitro-cli \
-            "${RELEASE_URL}/nitro-cli-linux-x86_64"
-        chmod +x /usr/local/bin/nitro-cli
-        ok "nitro-cli binary installed"
-    fi
+    warn "aws-nitro-enclaves-cli not in apt — using release binary"
+    curl -fsSL -o /usr/local/bin/nitro-cli \
+        "${RELEASE_URL}/nitro-cli-linux-x86_64"
+    chmod +x /usr/local/bin/nitro-cli
+    ok "nitro-cli binary installed"
 fi
 
 # Remove any stale blacklist from a previous script run.
@@ -628,13 +634,14 @@ if [[ -z "$ENCLAVE_ID" ]]; then
     cat /tmp/run-enclave.json
     warn "--- nitro_enclaves kernel messages ---"
     dmesg | grep -i "nitro\|enclave\|vsock" | tail -20 || true
+    warn "--- AppArmor denials (vsock bind often blocked by aa profile) ---"
+    dmesg | grep -i "apparmor\|DENIED" | tail -10 || true
+    journalctl -k --since "5 minutes ago" 2>/dev/null | grep -i "DENIED\|apparmor" | tail -10 || true
     warn "--- nitro error logs ---"
     for _elog in $(ls -t /var/log/nitro_enclaves/err*.log 2>/dev/null | head -5); do
         warn "  $_elog:"
         cat "$_elog" 2>/dev/null || true
     done
-    # Delete the EIF cache so the next run forces a fresh build — the cached
-    # EIF may have been built from a stale binary or with a different Dockerfile.
     rm -f "$HASH_FILE"
     warn "EIF cache cleared — next run will rebuild the enclave image"
     fatal "Failed to start enclave — re-run with ENCLAVE_DEBUG=true for console output"
