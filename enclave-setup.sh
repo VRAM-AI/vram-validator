@@ -231,17 +231,12 @@ else
     # 2. Choose which CPUs to dedicate to the enclave pool.
     #    The driver requires ALL hyperthreads of a physical core to be in the
     #    pool together — you cannot mix threads from different cores.
-    #    We walk CPUs from the end (avoiding CPU 0 which handles IRQs), read
-    #    each CPU's thread_siblings_list, and accumulate whole cores until we
-    #    have enough vCPUs.
-    # Bring all CPUs back online before topology scan — a previous nitro_enclaves
-    # load may have left pool CPUs offline, which causes nproc --all to
-    # undercount and skews the sysfs core_id mapping (core_id exists but the
-    # CPU won't be given to the new pool if it's still marked offline).
-    for _ocpu in /sys/devices/system/cpu/cpu[0-9]*/online; do
-        [[ -f "$_ocpu" ]] && echo 1 > "$_ocpu" 2>/dev/null || true
-    done
-
+    #
+    # IMPORTANT: do NOT re-online pool CPUs before the topology scan.
+    # The sysfs core_id files exist for offline CPUs, so the scan works fine.
+    # Re-onlining first would undo the pool state and force an unnecessary
+    # rmmod+modprobe that disrupts the host vsock transport (causing E36).
+    # nproc --all counts installed CPUs regardless of online state.
     TOTAL_CPUS=$(nproc --all)
     if [[ $ENCLAVE_CPU_COUNT -ge $TOTAL_CPUS ]]; then
         fatal "Cannot reserve ${ENCLAVE_CPU_COUNT} CPUs — host only has ${TOTAL_CPUS}"
@@ -342,7 +337,11 @@ PYEOF
         fi
 
     else
-        # Fresh load — CPUs should be online (we re-onlined them above).
+        # Fresh load — bring pool CPUs online before modprobe (they may be
+        # offline from a previous session's manual offline or /etc/modprobe.d).
+        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+            echo 1 > "/sys/devices/system/cpu/cpu${_cpu}/online" 2>/dev/null || true
+        done
         rm -f /etc/modprobe.d/nitro_enclaves.conf
         if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
             dmesg | tail -10 >&2
