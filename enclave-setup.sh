@@ -280,47 +280,82 @@ PYEOF
     fi
     ok "Reserving CPUs ${CPU_LIST} for enclave pool (of ${TOTAL_CPUS} total, aligned to physical cores)"
 
-    # 3. Reload the nitro_enclaves module with ne_cpus to activate the pool.
-    #    Skip if an enclave with our CID is already running (pool already set).
+    # 3. Configure the CPU pool in the nitro_enclaves kernel module.
+    #
+    # IMPORTANT: rmmod + modprobe nitro_enclaves disrupts the host vsock
+    # transport state, causing the enclave heartbeat bind to fail (E36).
+    # We avoid the reload entirely when the desired pool is already active
+    # (i.e. the desired CPUs are already offline/in-pool).
     EXISTING_ENCLAVE=$(nitro-cli describe-enclaves 2>/dev/null | \
         jq -r ".[] | select(.EnclaveCID == ${ENCLAVE_CID}) | .EnclaveID" 2>/dev/null || echo "")
 
     if [[ -n "$EXISTING_ENCLAVE" ]]; then
         ok "Enclave already running with CID ${ENCLAVE_CID} — CPU pool already configured"
-        echo "vm.nr_hugepages=${HUGE_PAGES}" \
-            > /etc/sysctl.d/20-nitro-enclaves.conf
-    else
-        if lsmod | grep -q "^nitro_enclaves"; then
+        echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
+
+    elif lsmod | grep -q "^nitro_enclaves"; then
+        # Module already loaded — check if all desired CPUs are offline (in pool).
+        _pool_ok=true
+        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+            _f="/sys/devices/system/cpu/cpu${_cpu}/online"
+            _state=$(cat "$_f" 2>/dev/null || echo "1")
+            [[ "$_state" != "0" ]] && _pool_ok=false && break
+        done
+
+        if $_pool_ok; then
+            ok "nitro_enclaves already loaded with CPUs ${CPU_LIST} in pool — skipping reload"
+        else
+            # Pool is wrong — must reload. Bring CPUs online first (rmmod exit
+            # may not re-online them), then rmmod, then re-online, then modprobe.
+            for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+                echo 1 > "/sys/devices/system/cpu/cpu${_cpu}/online" 2>/dev/null || true
+            done
             if ! rmmod nitro_enclaves 2>/dev/null; then
                 fatal "nitro_enclaves in use — terminate existing enclaves first: sudo nitro-cli terminate-enclave --all"
             fi
-            sleep 0.5
+            sleep 1
+            # Re-online with retry — rmmod may not re-online CPUs on kernel 6.17.
+            for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+                _f="/sys/devices/system/cpu/cpu${_cpu}/online"
+                for _t in $(seq 1 20); do
+                    [[ "$(cat "$_f" 2>/dev/null)" == "1" ]] && break
+                    echo 1 > "$_f" 2>/dev/null || true; sleep 0.1
+                done
+                [[ "$(cat "$_f" 2>/dev/null)" != "1" ]] && \
+                    fatal "CPU ${_cpu} still offline after rmmod — reboot the instance to reset CPU state"
+            done
+            rm -f /etc/modprobe.d/nitro_enclaves.conf
+            if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
+                dmesg | tail -10 >&2
+                fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
+            fi
+            ok "nitro_enclaves reloaded with ne_cpus=${CPU_LIST}"
+            echo "options nitro_enclaves ne_cpus=${CPU_LIST}" > /etc/modprobe.d/nitro_enclaves.conf
+            echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
+            ok "Pool settings saved (persists across reboots)"
         fi
-        sleep 0.3
-        # Re-online any CPUs the previous module load took offline.
-        # rmmod does not always restore CPU online state; if they're still
-        # offline when we modprobe, the driver returns EINVAL.
-        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
-            _f="/sys/devices/system/cpu/cpu${_cpu}/online"
-            [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
-        done
-        # Remove stale conf so modprobe doesn't merge old ne_cpus with the new value.
+
+    else
+        # Fresh load — CPUs should be online (we re-onlined them above).
         rm -f /etc/modprobe.d/nitro_enclaves.conf
         if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
             dmesg | tail -10 >&2
             fatal "Could not load nitro_enclaves with ne_cpus=${CPU_LIST}"
         fi
         ok "nitro_enclaves loaded with ne_cpus=${CPU_LIST}"
-
-        # 4. Persist across reboots (only when we actually loaded the module;
-        #    do NOT overwrite the conf in the "already running" path — the
-        #    enclave keeps CPUs offline so lscpu sees a truncated topology,
-        #    causing the Python to compute a wrong CPU_LIST including CPU 0).
-        echo "options nitro_enclaves ne_cpus=${CPU_LIST}" \
-            > /etc/modprobe.d/nitro_enclaves.conf
-        echo "vm.nr_hugepages=${HUGE_PAGES}" \
-            > /etc/sysctl.d/20-nitro-enclaves.conf
+        echo "options nitro_enclaves ne_cpus=${CPU_LIST}" > /etc/modprobe.d/nitro_enclaves.conf
+        echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
         ok "Pool settings saved (persists across reboots)"
+    fi
+
+    # After any pool change (or on fresh load), reload vhost_vsock so the
+    # vsock transport is in a clean state before run-enclave.
+    # Loading nitro_enclaves can disrupt host vsock transport registration.
+    if lsmod | grep -q "^vhost_vsock"; then
+        rmmod vhost_vsock 2>/dev/null || true
+        sleep 0.3
+        modprobe vhost_vsock 2>/dev/null || true
+        sleep 0.5
     fi
 fi
 
@@ -514,36 +549,52 @@ if [[ "$ENCLAVE_DEBUG" == "true" ]]; then
     DEBUG_FLAG="--debug-mode"
 fi
 
-# Pre-flight: verify AF_VSOCK bind actually works before launching.
-# Without a functional transport, nitro-cli fails at E36 boot heartbeat.
-if ! python3 - <<'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
-try:
-    s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 65432))
-    s.close(); sys.exit(0)
-except Exception: sys.exit(1)
+# Pre-flight: test AF_VSOCK bind on the ports nitro-cli uses for the
+# enclave heartbeat (9000) and our own diagnostic port (65432).
+# A bind failure here means run-enclave will fail with E36 vsock error.
+python3 - <<'PYEOF'
+import socket, sys, os
+AF_VSOCK  = getattr(socket, 'AF_VSOCK',       40)
+CID_ANY   = getattr(socket, 'VMADDR_CID_ANY', 0xFFFFFFFF)
+failed = []
+for port in [9000, 9001, 65432]:
+    try:
+        s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((CID_ANY, port))
+        s.close()
+    except Exception as e:
+        failed.append((port, str(e)))
+if failed:
+    for p, e in failed:
+        print(f"vsock port {p} FAILED: {e}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
 PYEOF
-then
-    warn "AF_VSOCK bind pre-flight FAILED — attempting emergency recovery"
+_vsock_rc=$?
+if [[ $_vsock_rc -ne 0 ]]; then
+    warn "AF_VSOCK bind pre-flight FAILED on heartbeat ports — attempting recovery"
+    rmmod vhost_vsock 2>/dev/null || true
+    sleep 0.3
     modprobe vhost 2>/dev/null || true
     modprobe vhost_vsock 2>/dev/null || true
-    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    sleep 0.5
     if python3 - <<'PYEOF' 2>/dev/null
 import socket, sys
 s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
-try:
-    s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 65432))
-    s.close(); sys.exit(0)
-except Exception: sys.exit(1)
+s.bind((getattr(socket,'VMADDR_CID_ANY',0xFFFFFFFF), 9000))
+s.close(); sys.exit(0)
 PYEOF
     then
         ok "AF_VSOCK bind recovered"
     else
-        warn "AF_VSOCK still failing — E36 boot heartbeat will likely fail"
+        warn "AF_VSOCK port 9000 still failing — E36 boot heartbeat will fail"
+        warn "vsock modules: $(lsmod | awk '/vsock/{printf \"%s(ref=%s) \",$1,$3}')"
         warn "Devices: $(ls /dev/vhost-vsock /dev/vsock 2>/dev/null | tr '\n' ' '; echo)"
         warn "Consider rebooting the instance to restore vsock state"
     fi
+else
+    ok "AF_VSOCK bind test passed on ports 9000, 9001, 65432"
 fi
 
 nitro-cli run-enclave \
