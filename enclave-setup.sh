@@ -320,21 +320,20 @@ PYEOF
         echo "vm.nr_hugepages=${HUGE_PAGES}" > /etc/sysctl.d/20-nitro-enclaves.conf
 
     else
-        # Need to (re)load the module.
-        # Step 1: rmmod any existing load (CPUs must be online for clean rmmod).
-        if lsmod | grep -q "^nitro_enclaves"; then
-            for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
-                _f="/sys/devices/system/cpu/cpu${_cpu}/online"
-                for _t in $(seq 1 20); do
-                    [[ "$(cat "$_f" 2>/dev/null)" == "1" ]] && break
-                    echo 1 > "$_f" 2>/dev/null || true; sleep 0.1
-                done
+        # Need to (re)load the module.  CPUs must be online before modprobe.
+        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
+            _f="/sys/devices/system/cpu/cpu${_cpu}/online"
+            for _t in $(seq 1 20); do
+                [[ "$(cat "$_f" 2>/dev/null)" == "1" ]] && break
+                echo 1 > "$_f" 2>/dev/null || true; sleep 0.1
             done
+        done
+        if lsmod | grep -q "^nitro_enclaves"; then
             if ! rmmod nitro_enclaves 2>/dev/null; then
                 fatal "nitro_enclaves in use — terminate existing enclaves first: sudo nitro-cli terminate-enclave --all"
             fi
             sleep 1
-            # rmmod may not re-online CPUs on some kernels — retry explicitly.
+            # rmmod may not re-online CPUs on kernel 6.17 — retry explicitly.
             for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
                 _f="/sys/devices/system/cpu/cpu${_cpu}/online"
                 for _t in $(seq 1 20); do
@@ -342,26 +341,9 @@ PYEOF
                     echo 1 > "$_f" 2>/dev/null || true; sleep 0.1
                 done
                 [[ "$(cat "$_f" 2>/dev/null)" != "1" ]] && \
-                    warn "CPU ${_cpu} still offline after rmmod (will pre-offline anyway)"
+                    fatal "CPU ${_cpu} still offline after rmmod — reboot the instance to reset CPU state"
             done
         fi
-        # Step 2: pre-offline the enclave CPUs before loading the module.
-        # On some kernels the ne_cpus cpu_down() path at modprobe time does not
-        # reliably transition vCPUs on Nitro instances — the module loads without
-        # error but the CPUs remain online, causing run-enclave to fail with
-        # "CPU X is not onlined [rc=1]".  Offlining them here lets the driver
-        # find them already offline and add them to its pool without cpu_down().
-        for _cpu in $(echo "${CPU_LIST}" | tr ',' ' '); do
-            _f="/sys/devices/system/cpu/cpu${_cpu}/online"
-            for _t in $(seq 1 20); do
-                [[ "$(cat "$_f" 2>/dev/null)" == "0" ]] && break
-                echo 0 > "$_f" 2>/dev/null || true; sleep 0.1
-            done
-            [[ "$(cat "$_f" 2>/dev/null)" != "0" ]] && \
-                warn "CPU ${_cpu} could not be pre-offlined — pool claim may fail"
-        done
-        sleep 0.2
-        # Step 3: load module (finds CPUs already offline, claims them for pool).
         rm -f /etc/modprobe.d/nitro_enclaves.conf
         if ! modprobe nitro_enclaves ne_cpus="${CPU_LIST}"; then
             dmesg | tail -10 >&2
@@ -385,8 +367,7 @@ fi
 # ─── 5. Install vram-cli (on-chain registration tool) ───────────────────────
 step "Installing vram-cli"
 if command -v vram-cli >/dev/null 2>&1; then
-    _VCVER=$(vram-cli --version 2>/dev/null || vram-cli -V 2>/dev/null || echo "(version unknown)")
-    ok "vram-cli already installed: $(echo "$_VCVER" | head -1)"
+    ok "vram-cli already installed: $(vram-cli --version 2>&1 | head -1)"
 else
     if curl -fsSL --retry 3 -o /usr/local/bin/vram-cli \
         "${RELEASE_URL}/vram-cli-linux-x86_64" 2>/dev/null && \
