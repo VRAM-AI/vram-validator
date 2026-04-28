@@ -206,11 +206,13 @@ rm -f /etc/modprobe.d/nitro_enclaves.conf
 modprobe nitro_enclaves 2>/dev/null || true
 
 # Create the enclave sockets directory early — describe-enclaves needs it.
-# 755 so non-root users (ubuntu) can list enclaves without sudo.
-# tmpfiles.d entry recreates it on every reboot (it lives on tmpfs).
+# 775 root:ne so non-root users in the `ne` group can bind management sockets
+# (nitro-cli's connection_listener.rs binds here; EACCES if 755 root:root).
 mkdir -p /run/nitro_enclaves
-chmod 755 /run/nitro_enclaves
-echo 'd /run/nitro_enclaves 0755 root root -' > /etc/tmpfiles.d/nitro-enclaves.conf
+chown root:ne /run/nitro_enclaves 2>/dev/null || true
+chmod 775 /run/nitro_enclaves
+# tmpfiles.d recreates it with correct perms on every reboot (lives on tmpfs)
+echo 'd /run/nitro_enclaves 0775 root ne -' > /usr/lib/tmpfiles.d/nitro_enclaves.conf
 
 if getent group ne >/dev/null 2>&1; then
     for u in ubuntu ec2-user; do
@@ -238,6 +240,57 @@ if [[ -n "$ALLOC_SVC" ]]; then
     systemctl restart nitro-enclaves-allocator.service
     sleep 2
     ok "Allocator service running"
+
+    # AL2023 / kernel 6.x: the allocator writes the CPU pool to ne_cpus but the
+    # nitro_enclaves driver fails to set it up at load time (rc=-22, "No CPUs
+    # available in CPU pool"). Root cause: CPUs aren't in the exact state the
+    # driver expects at module-load time. Fix: read the pool the allocator chose,
+    # bring those CPUs back online, then re-write ne_cpus — the driver offlines
+    # them cleanly on the re-write instead of at module init.
+    _NE_CPUS=$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || echo "")
+    if [[ -n "$_NE_CPUS" ]]; then
+        for _cpu in $(echo "$_NE_CPUS" | tr ',' ' '); do
+            echo 1 > /sys/devices/system/cpu/cpu${_cpu}/online 2>/dev/null || true
+        done
+        sleep 1
+        echo "$_NE_CPUS" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
+        sleep 1
+        _POOL_NOW=$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || echo "")
+        ok "CPU pool applied: ${_POOL_NOW}"
+    fi
+
+    # Install a oneshot service so this re-apply survives reboots.
+    # The allocator service alone is not enough on AL2023.
+    cat > /usr/local/sbin/fix-nitro-pool.sh <<'FIXEOF'
+#!/bin/bash
+# Re-apply the nitro_enclaves CPU pool after the allocator sets ne_cpus.
+# Required on AL2023 because the driver's boot-time pool setup returns rc=-22.
+NE_CPUS=$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || echo "")
+[[ -z "$NE_CPUS" ]] && exit 0
+for cpu in $(echo "$NE_CPUS" | tr ',' ' '); do
+    echo 1 > /sys/devices/system/cpu/cpu${cpu}/online 2>/dev/null || true
+done
+sleep 1
+echo "$NE_CPUS" > /sys/module/nitro_enclaves/parameters/ne_cpus
+FIXEOF
+    chmod +x /usr/local/sbin/fix-nitro-pool.sh
+
+    cat > /etc/systemd/system/fix-nitro-pool.service <<'SVCEOF'
+[Unit]
+Description=Re-apply Nitro Enclaves CPU pool (AL2023 boot-time rc=-22 workaround)
+After=nitro-enclaves-allocator.service
+Requires=nitro-enclaves-allocator.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fix-nitro-pool.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload
+    systemctl enable fix-nitro-pool.service 2>/dev/null || true
 else
     # No allocator service — reserve resources directly via the kernel module.
     #
