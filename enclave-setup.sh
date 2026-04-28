@@ -93,7 +93,8 @@ fi
 ok "Detected package manager: ${_PKG_MGR}"
 
 if [[ "$_PKG_MGR" == "dnf" ]]; then
-    dnf install -y curl jq || fatal "dnf install curl jq failed"
+    # AL2023 ships curl-minimal which conflicts with the full curl package — skip curl (binary already present)
+    dnf install -y jq || fatal "dnf install jq failed"
     # Docker on AL2023: try plain 'docker' first, then Docker CE repo
     if ! dnf install -y docker 2>&1; then
         warn "docker package not found — trying Docker CE repo"
