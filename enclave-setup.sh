@@ -708,21 +708,25 @@ sleep 2
 ok "vsock bridge running on 127.0.0.1:3000"
 
 # ─── 11. Health check ───────────────────────────────────────────────────────
-step "Health check (waiting up to 30s for enclave to serve /health)"
+step "Health check (waiting up to 120s for enclave to serve /health)"
 HEALTH_OK=false
-for i in $(seq 1 30); do
+for i in $(seq 1 120); do
     if curl -fsS --max-time 2 http://localhost:3000/health_check >/dev/null 2>&1; then
         HEALTH_OK=true
         break
+    fi
+    if (( i % 10 == 0 )); then
+        warn "Still waiting… ${i}s elapsed"
     fi
     sleep 1
 done
 
 if [[ "$HEALTH_OK" == "true" ]]; then
-    ok "Enclave is healthy"
+    ok "Enclave is healthy (responded after ~${i}s)"
 else
-    warn "Enclave did not respond to /health in 30s"
+    warn "Enclave did not respond to /health_check in 120s"
     warn "Check: nitro-cli describe-enclaves"
+    warn "Logs:  sudo ENCLAVE_DEBUG=true bash enclave-setup.sh   (rebuild with debug mode)"
     warn "Logs:  nitro-cli console --enclave-id $ENCLAVE_ID   (debug builds only)"
 fi
 
