@@ -154,38 +154,36 @@ if [[ "$_NITRO_FROM_PKG" == "false" ]]; then
     fi
 fi
 
-# Remove any stale blacklist from a previous script run.
-rm -f /etc/modprobe.d/blacklist-vmw-vsock.conf
-
-# On EC2 Nitro, the virtio-vsock device is presented by the hypervisor.
-# The guest driver (vmw_vsock_virtio_transport) must be both LOADED and BOUND
-# to the device for the transport to register — loading the module alone is not
-# enough.  The driver's refcount in lsmod will be 0 if it loaded without a
-# device probe.  We explicitly trigger a virtio bus scan after loading so the
-# kernel binds the driver to the vsock device.
+# On Nitro parent instances, enclave vsock uses vhost_vsock (H2G transport) —
+# the parent acts as a host relative to the enclave, so vhost_vsock routes
+# AF_VSOCK connects to enclave CIDs.  vmw_vsock_virtio_transport (G2H) would
+# intercept those connects and fail with ENODEV because the virtio vsock device
+# only routes to the hypervisor (CID 2), not to enclave CIDs.
+# vhost_vsock MUST be loaded before the enclave starts so the NE driver can
+# register the enclave CID with the vhost backend via /dev/vhost-vsock.
 modprobe vsock 2>/dev/null || true
 modprobe vhost 2>/dev/null || true
 modprobe vhost_vsock 2>/dev/null || true
-modprobe vmw_vsock_virtio_transport 2>/dev/null || true
 
-# Explicitly bind vmw_vsock_virtio_transport to the virtio-vsock device (device
-# ID 19 = 0x0013) if it exists but hasn't been auto-probed (e.g. after manual
-# module reload).  Writing the device name to the driver's bind sysfs file
-# triggers probe() and vsock_core_register() without needing udevadm.
-for _vdev in /sys/bus/virtio/devices/*/; do
-    _id=$(printf '%d' "$(cat "${_vdev}device" 2>/dev/null || echo 0)" 2>/dev/null || echo 0)
-    if [[ "$_id" -eq 19 ]]; then
-        _devname=$(basename "$_vdev")
-        # Bind succeeds silently; EBUSY means already bound (both are fine).
-        echo "$_devname" > /sys/bus/virtio/drivers/vmw_vsock_virtio_transport/bind 2>/dev/null || true
-        ok "Bound vmw_vsock_virtio_transport to virtio vsock device $_devname"
-        break
-    fi
-done
+# Unload vmw_vsock_virtio_transport if present — it registers as H2G and
+# overrides vhost_vsock, causing ENODEV on connect to enclave CIDs.
+if lsmod | grep -q vmw_vsock_virtio_transport; then
+    # Unbind from any virtio device first so rmmod succeeds
+    for _vdev in /sys/bus/virtio/drivers/vmw_vsock_virtio_transport/virtio*/; do
+        [[ -e "$_vdev" ]] && echo "$(basename "$_vdev")" \
+            > /sys/bus/virtio/drivers/vmw_vsock_virtio_transport/unbind 2>/dev/null || true
+    done
+    modprobe -r vmw_vsock_virtio_transport 2>/dev/null || true
+fi
 
-# Functional test: actually try to bind an AF_VSOCK socket.
-# lsmod refcounts only show module dependencies, not transport registration —
-# a module can be loaded but unbound (no device probe) and bind() still fails.
+if [[ -e /dev/vhost-vsock ]]; then
+    ok "vhost_vsock loaded — /dev/vhost-vsock present"
+else
+    warn "vhost_vsock failed to load — AF_VSOCK to enclave CIDs may not work"
+    warn "lsmod: $(lsmod | awk '/vsock|vhost|nitro/{printf \"%s(ref=%s) \",$1,$3}')"
+fi
+
+# Functional test: bind an AF_VSOCK socket (confirms vsock module is functional).
 if python3 - <<'PYEOF' 2>/dev/null
 import socket, sys
 s = socket.socket(getattr(socket,'AF_VSOCK',40), socket.SOCK_STREAM)
@@ -199,9 +197,7 @@ then
     ok "AF_VSOCK bind test passed — vsock transport is functional"
 else
     warn "AF_VSOCK bind FAILED — vsock transport not registered"
-    warn "lsmod: $(lsmod | awk '/vsock|nitro/{printf \"%s(ref=%s) \",$1,$3}')"
-    warn "virtio devices: $(ls /sys/bus/virtio/devices/ 2>/dev/null | tr '\n' ' ')"
-    warn "Rebooting the instance will restore the original vsock state."
+    warn "lsmod: $(lsmod | awk '/vsock|vhost|nitro/{printf \"%s(ref=%s) \",$1,$3}')"
 fi
 
 # Load nitro_enclaves.  Remove any stale modprobe.d options file first so
