@@ -93,7 +93,15 @@ fi
 ok "Detected package manager: ${_PKG_MGR}"
 
 if [[ "$_PKG_MGR" == "dnf" ]]; then
-    dnf install -y curl jq docker >/dev/null 2>&1
+    dnf install -y curl jq >/dev/null 2>&1
+    # Docker on AL2023: try plain 'docker' first, then Docker CE repo
+    if ! dnf install -y docker >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core >/dev/null 2>&1 || true
+        dnf config-manager --add-repo \
+            https://download.docker.com/linux/fedora/docker-ce.repo >/dev/null 2>&1 || true
+        dnf install -y docker-ce docker-ce-cli containerd.io >/dev/null 2>&1 || \
+            fatal "Could not install Docker on this system"
+    fi
     ok "Base packages installed"
     systemctl enable --now docker >/dev/null 2>&1 || true
     ok "Docker running"
