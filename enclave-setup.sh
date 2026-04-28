@@ -8,7 +8,7 @@
 # localhost:3000.
 #
 # Run on AWS EC2 instances with Nitro Enclaves enabled (m5*, m6*, m7*, c5*, etc.)
-# Ubuntu 22.04 / 24.04 x86_64.
+# Ubuntu 22.04 / 24.04 or Amazon Linux 2023, x86_64.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/VRAM-AI/vram-validator/main/enclave-setup.sh | sudo bash
@@ -81,46 +81,68 @@ else
     ok "/dev/nitro_enclaves is present"
 fi
 
-# ─── 2. APT prerequisites ───────────────────────────────────────────────────
-step "Installing apt prerequisites"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
-    curl \
-    jq \
-    docker.io \
-    linux-modules-extra-aws 2>/dev/null || \
-apt-get install -y -qq \
-    curl \
-    jq \
-    docker.io
-ok "Base packages installed"
+# ─── 2. OS detection + prerequisites ────────────────────────────────────────
+step "Installing prerequisites"
+_OS_ID=$(grep -oP '(?<=^ID=)[^"]+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
+_OS_LIKE=$(grep -oP '(?<=^ID_LIKE=)[^"]+' /etc/os-release 2>/dev/null | tr -d '"' || echo "")
 
-systemctl enable --now docker >/dev/null 2>&1 || true
-ok "Docker running"
+if [[ "$_OS_ID" == "amzn" || "$_OS_LIKE" == *"fedora"* || "$_OS_LIKE" == *"rhel"* ]]; then
+    _PKG_MGR="dnf"
+else
+    _PKG_MGR="apt"
+fi
+ok "Detected OS: ${_OS_ID} (package manager: ${_PKG_MGR})"
+
+if [[ "$_PKG_MGR" == "dnf" ]]; then
+    dnf install -y curl jq docker >/dev/null 2>&1
+    ok "Base packages installed"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    ok "Docker running"
+else
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq \
+        curl \
+        jq \
+        docker.io \
+        linux-modules-extra-aws 2>/dev/null || \
+    apt-get install -y -qq \
+        curl \
+        jq \
+        docker.io
+    ok "Base packages installed"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    ok "Docker running"
+fi
 
 # ─── 3. Install nitro-cli ───────────────────────────────────────────────────
 step "Installing nitro-cli"
-# Always prefer the apt package — it is compiled for Ubuntu and includes the
-# allocator service + proper udev rules.  The downloaded binary (v1.4.4) has
-# a confirmed vsock bind failure in its enclave-proc daemon on kernel 6.17+.
-# If apt succeeds, remove any previously-downloaded /usr/local/bin/nitro-cli
-# so the apt binary (at /usr/bin/nitro-cli) is found first on PATH.
-_NITRO_FROM_APT=false
-if apt-get install -y -qq aws-nitro-enclaves-cli 2>/dev/null; then
+# Prefer the distro package — it includes the allocator service + udev rules.
+# The downloaded binary (v1.4.4) has a confirmed vsock bind failure on kernel 6.17+.
+_NITRO_FROM_PKG=false
+if [[ "$_PKG_MGR" == "dnf" ]]; then
+    if dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel >/dev/null 2>&1; then
+        [[ -f /usr/local/bin/nitro-cli ]] && rm -f /usr/local/bin/nitro-cli
+        _NITRO_FROM_PKG=true
+        ok "nitro-cli installed via dnf: $(nitro-cli --version 2>&1 | head -1)"
+    fi
+elif apt-get install -y -qq aws-nitro-enclaves-cli 2>/dev/null; then
     apt-get install -y -qq aws-nitro-enclaves-cli-devel 2>/dev/null || true
-    # Remove the manually-downloaded copy so the apt version takes precedence
     [[ -f /usr/local/bin/nitro-cli ]] && rm -f /usr/local/bin/nitro-cli
-    _NITRO_FROM_APT=true
+    _NITRO_FROM_PKG=true
     ok "nitro-cli installed via apt: $(nitro-cli --version 2>&1 | head -1)"
-elif command -v nitro-cli >/dev/null 2>&1; then
-    ok "nitro-cli already installed (binary): $(nitro-cli --version 2>&1 | head -1)"
-else
-    warn "aws-nitro-enclaves-cli not in apt — using release binary"
-    curl -fsSL -o /usr/local/bin/nitro-cli \
-        "${RELEASE_URL}/nitro-cli-linux-x86_64"
-    chmod +x /usr/local/bin/nitro-cli
-    ok "nitro-cli binary installed"
+fi
+
+if [[ "$_NITRO_FROM_PKG" == "false" ]]; then
+    if command -v nitro-cli >/dev/null 2>&1; then
+        ok "nitro-cli already installed (binary): $(nitro-cli --version 2>&1 | head -1)"
+    else
+        warn "aws-nitro-enclaves-cli not in package manager — using release binary"
+        curl -fsSL -o /usr/local/bin/nitro-cli \
+            "${RELEASE_URL}/nitro-cli-linux-x86_64"
+        chmod +x /usr/local/bin/nitro-cli
+        ok "nitro-cli binary installed"
+    fi
 fi
 
 # Remove any stale blacklist from a previous script run.
@@ -649,7 +671,11 @@ ok "Enclave started: $ENCLAVE_ID"
 
 # ─── 10. vsock-proxy: localhost:3000 → enclave:3000 ─────────────────────────
 step "Setting up vsock-proxy bridge (localhost:3000 → CID ${ENCLAVE_CID}:3000)"
-apt-get install -y -qq socat
+if [[ "$_PKG_MGR" == "dnf" ]]; then
+    dnf install -y socat >/dev/null 2>&1
+else
+    apt-get install -y -qq socat
+fi
 
 tee /etc/systemd/system/vram-vsock-bridge.service > /dev/null << SVCEOF
 [Unit]
