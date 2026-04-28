@@ -83,15 +83,14 @@ fi
 
 # ─── 2. OS detection + prerequisites ────────────────────────────────────────
 step "Installing prerequisites"
-_OS_ID=$(grep -oP '(?<=^ID=)[^"]+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
-_OS_LIKE=$(grep -oP '(?<=^ID_LIKE=)[^"]+' /etc/os-release 2>/dev/null | tr -d '"' || echo "")
-
-if [[ "$_OS_ID" == "amzn" || "$_OS_LIKE" == *"fedora"* || "$_OS_LIKE" == *"rhel"* ]]; then
+if command -v apt-get >/dev/null 2>&1; then
+    _PKG_MGR="apt"
+elif command -v dnf >/dev/null 2>&1; then
     _PKG_MGR="dnf"
 else
-    _PKG_MGR="apt"
+    fatal "Unsupported OS: neither apt-get nor dnf found"
 fi
-ok "Detected OS: ${_OS_ID} (package manager: ${_PKG_MGR})"
+ok "Detected package manager: ${_PKG_MGR}"
 
 if [[ "$_PKG_MGR" == "dnf" ]]; then
     dnf install -y curl jq docker >/dev/null 2>&1
