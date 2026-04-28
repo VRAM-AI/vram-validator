@@ -46,8 +46,21 @@ Go to the [AWS EC2 console](https://console.aws.amazon.com/ec2/v2/home#LaunchIns
 
 **AMI:** Amazon Linux 2023 (recommended — has native Nitro support)
 
-**Instance type:** `m7i.xlarge`
-> Do not use `t3` or free tier instances — they do not support Nitro Enclaves.
+**Instance type:** Choose from the table below. The enclave needs at least 2 dedicated vCPUs and 4 GB of RAM reserved for it, so the host must have at least 4 vCPUs and 8 GB total.
+
+| Instance | vCPUs | RAM | Notes |
+|---|---|---|---|
+| `m5.xlarge` | 4 | 16 GB | ✅ Recommended — best price/performance |
+| `m5.2xlarge` | 8 | 32 GB | ✅ If you need more headroom |
+| `m7i.xlarge` | 4 | 16 GB | ✅ Latest gen, slightly faster |
+| `c5.xlarge` | 4 | 8 GB | ✅ Works — tight on memory |
+| `c5.2xlarge` | 8 | 16 GB | ✅ Comfortable |
+| `r5.xlarge` | 4 | 32 GB | ✅ If memory-heavy workloads |
+| `t3.*` / `t2.*` | any | any | ❌ **Not supported** — T-family instances have no Nitro Enclave support |
+| `t3a.*` / `t4g.*` | any | any | ❌ **Not supported** |
+| `m6g.*` / `c7g.*` (ARM) | any | any | ❌ **Not supported** — Nitro Enclaves require x86_64 |
+
+> **Tip:** When in doubt, use `m5.xlarge`. It is the most widely tested instance type for Nitro Enclaves.
 
 **Key pair:** Create a new key pair, download the `.pem` file, keep it safe.
 
@@ -60,11 +73,25 @@ Go to the [AWS EC2 console](https://console.aws.amazon.com/ec2/v2/home#LaunchIns
 - Type: `gp3`
 - Encrypted: **Yes** — select your KMS key if you have one
 
-**Advanced details:**
-- Nitro Enclave: **Enable** ← this is the critical one
+**Advanced details — critical settings:**
+
+> ⚠️ **Nitro Enclave support cannot be enabled after launch.** You must check the box before clicking "Launch Instance". There is no way to add it to a running instance — you would need to terminate and relaunch.
+
+- **Nitro Enclave: Enable** ← scroll down in Advanced details, it is a single checkbox
 - IAM instance profile: attach a role with `secretsmanager:GetSecretValue` if you plan to use AWS Secrets Manager for your wallet mnemonic (recommended)
 
 Launch the instance.
+
+### How to confirm Nitro Enclaves is enabled
+
+After SSHing into the instance:
+
+```bash
+nitro-cli describe-enclaves
+# Expected output: [] (empty list — no enclaves running yet, but CLI works)
+```
+
+If you see `bash: nitro-cli: command not found` or `Failed to connect to NE socket`, the instance was launched **without** Nitro Enclave support. Terminate it and relaunch with the checkbox checked.
 
 ---
 
@@ -195,29 +222,71 @@ sudo journalctl -u vram-validator -f   # watch logs
 
 ## Nitro Enclave setup
 
-The Nitro Enclave is required to submit verified scores on mainnet. On testnet it runs in a compatibility mode — but to be production-ready, set it up now:
+The Nitro Enclave is required to submit verified scores. The enclave runs the `slcl-nautilus` binary inside the sealed hardware environment and signs every score with a key that never leaves it.
+
+### Debug mode vs production mode
+
+The enclave can run in two modes — **use production mode for everything except local development**:
+
+| | Debug mode | Production mode |
+|---|---|---|
+| How to start | `--debug-console` flag | No extra flag |
+| PCR values | All zeros in attestation | Real SHA-384 measurements |
+| On-chain registration | **Will be rejected** — zeros fail PCR check | ✅ Accepted |
+| Enclave console | Readable via `nitro-cli console` | Not accessible |
+| Use for | Diagnosing crashes during setup | Everything else |
+
+To check which mode your enclave is running:
+```bash
+nitro-cli describe-enclaves | python3 -m json.tool
+# "Flags": "NONE"        → production mode ✅
+# "Flags": "DEBUG_MODE"  → debug mode — registration will be rejected
+```
+
+### Start the enclave
 
 ```bash
-# Install nitro-cli, download the enclave EIF, create systemd service
-curl -sSf https://raw.githubusercontent.com/VRAM-AI/VRAM-HUB/master/scripts/start-validator.sh | bash
+# Install nitro-cli, download the enclave EIF, create systemd services
+curl -sSf https://raw.githubusercontent.com/VRAM-AI/VRAM-HUB/master/scripts/enclave-setup.sh | bash
+```
 
-# Register the enclave on-chain (one-time — or after every enclave restart)
-cargo run --bin vramhub-cli -- register-enclave \
+The script starts the enclave in **production mode** and creates:
+- `slcl-nautilus.service` — runs the enclave
+- `vram-vsock-bridge.service` — socat bridge (TCP 3000 → vsock CID 16:3000)
+
+Verify it started correctly:
+```bash
+nitro-cli describe-enclaves   # Flags must be "NONE"
+curl http://localhost:3000/health_check   # must return: ok
+```
+
+### Register on-chain (one-time per enclave)
+
+```bash
+source ~/.env
+vram-cli register-validator   # prints VRAMHUB_VALIDATOR_UID=N
+echo 'VRAMHUB_VALIDATOR_UID=N' >> ~/.env   # replace N
+source ~/.env
+
+vram-cli register-enclave \
   --enclave-url http://localhost:3000 \
   --validator-uid $VRAMHUB_VALIDATOR_UID
 ```
 
-After registration you'll see:
+After success:
 ```
-INFO: Enclave registered successfully pubkey=a3f9...
+Enclave registered successfully.
+VRAMHUB_ENCLAVE_PUBKEY=42c3adc8...
 ```
 
 Add to `.env`:
 ```bash
-VRAMHUB_NITRO_ENCLAVE=true
-VRAMHUB_ENCLAVE_PUBKEY=a3f9...   # from the line above
-VRAMHUB_ENCLAVE_OBJECT_ID=0x...  # printed after register-enclave
+VRAMHUB_ENCLAVE_PUBKEY=42c3adc8...
+VRAMHUB_ENCLAVE_URL=http://localhost:3000
+VRAMHUB_TEST_MODE=false
 ```
+
+> **Note:** You must re-run `register-enclave` any time the enclave EIF is rebuilt (PCR values change when code changes). The validator UID stays the same — only the enclave registration needs to be re-done.
 
 ---
 
@@ -242,15 +311,63 @@ Current testnet: [VRAMScan Explorer](https://suiscan.xyz/testnet/object/0x48703e
 **"compile_error: must be built on Linux"**
 The validator only runs on Linux. Use an EC2 instance, not your local machine.
 
-**"Nitro Enclave not available"**
-Your instance type doesn't support Nitro. Launch an `m7i.xlarge`, `c5.xlarge`, or any `m5`/`c5`/`r5` instance. `t3` instances do not support Nitro.
+**"Nitro Enclave not available" or `nitro-cli: command not found`**
+Your instance was launched without Nitro Enclave support enabled. This cannot be fixed on a running instance — terminate it and relaunch with **Nitro Enclave: Enable** checked in Advanced details. See the instance type table above; `t3`, `t4g`, and ARM instances do not support Nitro.
 
 **"MissingEnvVar: VRAMHUB_WALLET_MNEMONIC"**
 Your `.env` file isn't loaded. Run `source .env` before `vram-validator`, or use the systemd service which loads it automatically.
 
+**Enclave shows `Flags: DEBUG_MODE` instead of `NONE`**
+The enclave was started with `--debug-console`. Stop it and restart without that flag:
+```bash
+sudo nitro-cli terminate-enclave --enclave-name slcl-nautilus
+sudo nitro-cli run-enclave \
+  --eif-path /opt/vram/slcl-nautilus.eif \
+  --memory 4096 \
+  --cpu-count 2 \
+  --enclave-cid 16
+nitro-cli describe-enclaves   # confirm Flags: NONE
+```
+
+**`ArityMismatch in command 0` during register-validator**
+The CLI binary is out of date. Pull the latest and rebuild:
+```bash
+cd ~/vramhub-validator && git pull
+cargo build --release -p slcl-cli
+sudo cp target/release/slcl-cli /usr/local/bin/vram-cli
+```
+
+**`InsufficientStake` during register-validator**
+The contract requires 10 SUI stake minimum. Make sure you have SUI in your wallet (`sui client balance`) and the latest `vram-cli` binary which passes the correct stake.
+
+**`E_ALREADY_REGISTERED` during register-validator**
+Your address is already registered. Query your existing UID:
+```bash
+vram-cli status
+```
+
+**Health check returns empty / connection refused**
+The vsock bridge is not running. Start it:
+```bash
+sudo systemctl start vram-vsock-bridge
+sudo systemctl status vram-vsock-bridge
+curl http://localhost:3000/health_check   # should return: ok
+```
+If the bridge is running but curl still fails, the enclave may have crashed. Check:
+```bash
+nitro-cli describe-enclaves   # confirm State: RUNNING
+sudo journalctl -u slcl-nautilus -n 50 --no-pager
+```
+
 **Scores not submitting**
-Check that the enclave is running: `curl http://localhost:3000/health_check`
-If it returns nothing, restart the enclave service: `sudo systemctl restart slcl-nautilus`
+Check that the enclave is running and in production mode:
+```bash
+nitro-cli describe-enclaves   # State: RUNNING, Flags: NONE
+curl http://localhost:3000/health_check   # ok
+curl http://localhost:3000/get_attestation | python3 -m json.tool | grep test_mode
+# must show: "test_mode": false
+```
+If `test_mode` is true, set `VRAMHUB_TEST_MODE=false` in `.env` and restart the validator.
 
 ---
 
