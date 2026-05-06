@@ -207,51 +207,49 @@ ALLOC_SVC=$(systemctl list-unit-files 2>/dev/null | \
     awk '/nitro-enclaves-allocator/{print $1}' | head -1 || true)
 
 if [[ -n "$ALLOC_SVC" ]]; then
+    # AL2023 kernel 6.x: secondary CPUs boot offline. The nitro_enclaves driver
+    # needs CPUs to be ONLINE when ne_cpus is written so it can cpu_down() them.
+    # Writing the same value after the fact is a no-op — the driver only reacts
+    # to changes. Fix: online all secondary CPUs and clear the pool BEFORE the
+    # allocator writes ne_cpus for the first time.
+    for _f in /sys/devices/system/cpu/cpu[1-9]*/online; do
+        [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
+    done
+    # Clear any stale pool entry so the allocator's write triggers a fresh setup
+    echo "" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
+    sleep 0.5
+
     systemctl enable "$ALLOC_SVC"
     systemctl restart "$ALLOC_SVC" || true
     sleep 2
     ok "Allocator service: $ALLOC_SVC"
+    ok "CPU pool applied: $(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null)"
 
-    # AL2023 kernel 6.x: allocator sets ne_cpus but driver returns rc=-22 at
-    # module load. Fix: bring CPUs online, re-write the parameter so the driver
-    # offlines them cleanly.
-    _NE_CPUS=$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || echo "")
-    if [[ -n "$_NE_CPUS" ]]; then
-        for _c in $(echo "$_NE_CPUS" | tr ',' ' '); do
-            echo 1 > /sys/devices/system/cpu/cpu${_c}/online 2>/dev/null || true
-        done
-        sleep 1
-        echo "$_NE_CPUS" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
-        sleep 1
-        ok "CPU pool applied: $(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null)"
-    fi
-
-    # Persist this fix across reboots (AL2023 allocator alone is not enough)
-    cat > /usr/local/sbin/fix-nitro-pool.sh <<'FIX'
+    # Persist across reboots: pre-online service runs BEFORE the allocator
+    cat > /usr/local/sbin/pre-online-nitro-cpus.sh <<'PREONLINE'
 #!/bin/bash
-NE_CPUS=$(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || echo "")
-[[ -z "$NE_CPUS" ]] && exit 0
-for cpu in $(echo "$NE_CPUS" | tr ',' ' '); do
-    echo 1 > /sys/devices/system/cpu/cpu${cpu}/online 2>/dev/null || true
+# AL2023: bring secondary CPUs online before nitro_enclaves driver processes ne_cpus
+for f in /sys/devices/system/cpu/cpu[1-9]*/online; do
+    [[ -f "$f" ]] && echo 1 > "$f" 2>/dev/null || true
 done
-sleep 1
-echo "$NE_CPUS" > /sys/module/nitro_enclaves/parameters/ne_cpus
-FIX
-    chmod +x /usr/local/sbin/fix-nitro-pool.sh
-    cat > /etc/systemd/system/fix-nitro-pool.service <<UNIT
+echo "" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
+PREONLINE
+    chmod +x /usr/local/sbin/pre-online-nitro-cpus.sh
+    cat > /etc/systemd/system/pre-online-nitro-cpus.service <<UNIT
 [Unit]
-Description=Re-apply Nitro Enclaves CPU pool (AL2023 boot-time workaround)
-After=${ALLOC_SVC}
-Requires=${ALLOC_SVC}
+Description=Pre-online secondary CPUs for Nitro Enclaves (AL2023 fix)
+Before=${ALLOC_SVC}
+Wants=${ALLOC_SVC}
+DefaultDependencies=no
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/fix-nitro-pool.sh
+ExecStart=/usr/local/sbin/pre-online-nitro-cpus.sh
 RemainAfterExit=yes
 [Install]
-WantedBy=multi-user.target
+WantedBy=${ALLOC_SVC}
 UNIT
     systemctl daemon-reload
-    systemctl enable fix-nitro-pool.service 2>/dev/null || true
+    systemctl enable pre-online-nitro-cpus.service 2>/dev/null || true
 
 else
     # No allocator service — configure pool directly via kernel module
