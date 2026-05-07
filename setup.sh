@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-ENCLAVE_MEMORY_MIB="${ENCLAVE_MEMORY_MIB:-4096}"
+ENCLAVE_MEMORY_MIB="${ENCLAVE_MEMORY_MIB:-1024}"
 ENCLAVE_CPU_COUNT="${ENCLAVE_CPU_COUNT:-2}"
 ENCLAVE_CID="${ENCLAVE_CID:-16}"
 ENCLAVE_DEBUG="${ENCLAVE_DEBUG:-false}"
@@ -208,48 +208,65 @@ ALLOC_SVC=$(systemctl list-unit-files 2>/dev/null | \
 
 if [[ -n "$ALLOC_SVC" ]]; then
     # AL2023 kernel 6.x: secondary CPUs boot offline. The nitro_enclaves driver
-    # needs CPUs to be ONLINE when ne_cpus is written so it can cpu_down() them.
-    # Writing the same value after the fact is a no-op — the driver only reacts
-    # to changes. Fix: online all secondary CPUs and clear the pool BEFORE the
-    # allocator writes ne_cpus for the first time.
+    # calls cpu_down() to pool CPUs, but cpu_down() fails if the CPU is already
+    # offline (rc=-22 / EINVAL). Clearing ne_cpus on an already-loaded module is
+    # a no-op — the driver only reacts to changes. The only reliable fix is:
+    #   1. Unload the module entirely (clears all driver state)
+    #   2. Online all secondary CPUs while the module is absent
+    #   3. Reload the module fresh — driver starts with zero state, CPUs online
+    #   4. Start allocator — cpu_down() now succeeds on every CPU
+
+    systemctl stop "$ALLOC_SVC" 2>/dev/null || true
+    rmmod nitro_enclaves 2>/dev/null && sleep 1 || true
+
     for _f in /sys/devices/system/cpu/cpu[1-9]*/online; do
         [[ -f "$_f" ]] && echo 1 > "$_f" 2>/dev/null || true
     done
-    # Clear any stale pool entry so the allocator's write triggers a fresh setup
-    echo "" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
-    sleep 0.5
+    ok "CPUs online: $(cat /sys/devices/system/cpu/online)"
+
+    modprobe nitro_enclaves && sleep 1
 
     systemctl enable "$ALLOC_SVC"
-    systemctl restart "$ALLOC_SVC" || true
-    sleep 2
+    systemctl start "$ALLOC_SVC" || true
+    sleep 3
     ok "Allocator service: $ALLOC_SVC"
     ok "CPU pool applied: $(cat /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null)"
 
-    # Persist across reboots: pre-online service runs BEFORE the allocator
-    cat > /usr/local/sbin/pre-online-nitro-cpus.sh <<'PREONLINE'
+    # Verify no rc=-22 errors
+    if dmesg | tail -20 | grep -q 'not onlined'; then
+        warn "CPU pool setup may have failed — check: dmesg | grep nitro_enclaves"
+    fi
+
+    # Persist across reboots: nitro-cpu-fix service runs BEFORE the allocator.
+    # It unloads the module, onlines CPUs, then reloads — same sequence as above.
+    cat > /usr/local/sbin/nitro-cpu-fix.sh <<'CPUFIX'
 #!/bin/bash
-# AL2023: bring secondary CPUs online before nitro_enclaves driver processes ne_cpus
+# AL2023: rmmod + online CPUs + modprobe before allocator sets ne_cpus
+systemctl stop nitro-enclaves-allocator.service 2>/dev/null || true
+rmmod nitro_enclaves 2>/dev/null || true
+sleep 1
 for f in /sys/devices/system/cpu/cpu[1-9]*/online; do
     [[ -f "$f" ]] && echo 1 > "$f" 2>/dev/null || true
 done
-echo "" > /sys/module/nitro_enclaves/parameters/ne_cpus 2>/dev/null || true
-PREONLINE
-    chmod +x /usr/local/sbin/pre-online-nitro-cpus.sh
-    cat > /etc/systemd/system/pre-online-nitro-cpus.service <<UNIT
+modprobe nitro_enclaves
+sleep 1
+CPUFIX
+    chmod +x /usr/local/sbin/nitro-cpu-fix.sh
+    cat > /etc/systemd/system/nitro-cpu-fix.service <<UNIT
 [Unit]
-Description=Pre-online secondary CPUs for Nitro Enclaves (AL2023 fix)
+Description=Reload nitro_enclaves with secondary CPUs online (AL2023 E36 fix)
 Before=${ALLOC_SVC}
-Wants=${ALLOC_SVC}
+After=modules-load.target local-fs.target
 DefaultDependencies=no
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/pre-online-nitro-cpus.sh
+ExecStart=/usr/local/sbin/nitro-cpu-fix.sh
 RemainAfterExit=yes
 [Install]
-WantedBy=${ALLOC_SVC}
+WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
-    systemctl enable pre-online-nitro-cpus.service 2>/dev/null || true
+    systemctl enable nitro-cpu-fix.service 2>/dev/null || true
 
 else
     # No allocator service — configure pool directly via kernel module
