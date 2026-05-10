@@ -10,40 +10,196 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-x86_64:
+    name: Build (Linux x86_64)
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout VRAM-HUB source
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           repository: VRAM-AI/VRAM-HUB
-          ref: feat/vramscan-production
+          ref: master
           token: ${{ secrets.BUILD_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-      - run: sudo apt-get install -y libssl-dev pkg-config
-
-      - uses: actions/cache@v4.2.3
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-on-failure: true
 
-      - name: Build binary
+      - name: Install system dependencies
         run: |
-          cargo build --release --bin vramhub-validator
-          cp target/release/vramhub-validator vram-validator-linux-x86_64
+          sudo apt-get update -q
+          sudo apt-get install -y pkg-config libssl-dev libclang-dev clang
 
-      - name: Release
-        uses: softprops/action-gh-release@v2.3.2
+      - name: Build binaries
+        run: |
+          cargo build --release \
+            --bin vramhub-validator \
+            --bin vramhub-cli
+
+      - name: Strip and package
+        run: |
+          strip target/release/vramhub-validator
+          strip target/release/vramhub-cli
+          cp target/release/vramhub-validator vram-validator-linux-x86_64
+          cp target/release/vramhub-cli       vram-cli-linux-x86_64
+          sha256sum vram-validator-linux-x86_64 vram-cli-linux-x86_64 > checksums-x86_64.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: vram-validator-linux-x86_64
+          name: linux-x86_64
+          path: |
+            vram-validator-linux-x86_64
+            vram-cli-linux-x86_64
+            checksums-x86_64.txt
+
+  build-aarch64:
+    name: Build (Linux arm64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout VRAM-HUB source
+        uses: actions/checkout@v4
+        with:
+          repository: VRAM-AI/VRAM-HUB
+          ref: master
+          token: ${{ secrets.BUILD_TOKEN }}
+
+      - name: Install Rust stable + cross target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            pkg-config \
+            libssl-dev \
+            libclang-dev \
+            clang
+
+      - name: Build binaries (aarch64)
+        run: |
+          cargo build --release \
+            --bin vramhub-validator \
+            --bin vramhub-cli \
+            --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          OPENSSL_DIR: /usr/lib/ssl
+
+      - name: Strip and package (aarch64)
+        run: |
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/vramhub-validator
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/vramhub-cli
+          cp target/aarch64-unknown-linux-gnu/release/vramhub-validator vram-validator-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/vramhub-cli       vram-cli-linux-aarch64
+          sha256sum vram-validator-linux-aarch64 vram-cli-linux-aarch64 > checksums-aarch64.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: |
+            vram-validator-linux-aarch64
+            vram-cli-linux-aarch64
+            checksums-aarch64.txt
+
+  build-nautilus:
+    name: Build (vramhub-nautilus musl x86_64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout VRAM-HUB source
+        uses: actions/checkout@v4
+        with:
+          repository: VRAM-AI/VRAM-HUB
+          ref: master
+          token: ${{ secrets.BUILD_TOKEN }}
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y musl-tools pkg-config libssl-dev
+
+      - name: Build vramhub-nautilus (static musl)
+        run: |
+          cargo build --release \
+            --bin vramhub-nautilus \
+            --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Strip and package
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/vramhub-nautilus || true
+          cp target/x86_64-unknown-linux-musl/release/vramhub-nautilus vramhub-nautilus-linux-x86_64
+          sha256sum vramhub-nautilus-linux-x86_64 > checksums-nautilus.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nautilus
+          path: |
+            vramhub-nautilus-linux-x86_64
+            checksums-nautilus.txt
+
+  release:
+    name: Create GitHub Release
+    needs: [build-x86_64, build-aarch64, build-nautilus]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Merge checksums
+        run: |
+          cat checksums-x86_64.txt checksums-aarch64.txt checksums-nautilus.txt > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vram-validator-linux-x86_64
+            vram-validator-linux-aarch64
+            vram-cli-linux-x86_64
+            vram-cli-linux-aarch64
+            vramhub-nautilus-linux-x86_64
+            checksums.txt
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           body: |
-            ## vram-validator ${{ github.ref_name }}
+            ## VRAM Validator ${{ github.ref_name }}
 
             ### One-line install
 
@@ -51,10 +207,24 @@ jobs:
             curl -sSf https://raw.githubusercontent.com/VRAM-AI/vram-validator/main/install.sh | bash
             ```
 
-            ### Manual
+            ### Manual install
 
             ```bash
+            # Validator daemon
             curl -Lo vram-validator \
               https://github.com/VRAM-AI/vram-validator/releases/download/${{ github.ref_name }}/vram-validator-linux-x86_64
-            chmod +x vram-validator && ./vram-validator
+            chmod +x vram-validator
+
+            # CLI
+            curl -Lo vram-cli \
+              https://github.com/VRAM-AI/vram-validator/releases/download/${{ github.ref_name }}/vram-cli-linux-x86_64
+            chmod +x vram-cli
             ```
+
+            ### Full enclave setup (Nitro + one-click)
+
+            ```bash
+            curl -sSfL https://raw.githubusercontent.com/VRAM-AI/VRAM-HUB/master/scripts/install-validator.sh | bash
+            ```
+
+            Verify checksums with `sha256sum -c checksums.txt`.
