@@ -36,9 +36,11 @@ ENCLAVE_CID="${ENCLAVE_CID:-16}"
 ENCLAVE_DEBUG="${ENCLAVE_DEBUG:-false}"
 SKIP_REGISTER="${SKIP_REGISTER:-false}"
 VRAM_REPO="${VRAM_REPO:-VRAM-AI/vram-validator}"
+VRAMHUB_REPO="VRAM-AI/VRAM-HUB"
 INSTALL_DIR=/opt/vram
 BUILD_DIR=/tmp/vram-setup
 RELEASE_URL="https://github.com/${VRAM_REPO}/releases/latest/download"
+VRAMHUB_RELEASE_URL="https://github.com/${VRAMHUB_REPO}/releases/latest/download"
 RAW_URL="https://raw.githubusercontent.com/${VRAM_REPO}/main"
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
@@ -340,20 +342,18 @@ else
     warn "Pre-built EIF not available in release — building from binary"
     rm -f "$EIF_PATH" 2>/dev/null || true
 
-    # Download the nautilus binary
-    curl -fsSL --retry 3 -o "$BUILD_DIR/slcl-nautilus" \
-        "${RELEASE_URL}/slcl-nautilus-linux-x86_64" || \
-        fatal "Could not download slcl-nautilus binary from ${RELEASE_URL}"
-    chmod +x "$BUILD_DIR/slcl-nautilus"
-    ok "Downloaded slcl-nautilus binary"
+    # Download the nautilus binary (static musl — from VRAM-HUB releases)
+    curl -fsSL --retry 3 -o "$BUILD_DIR/vramhub-nautilus" \
+        "${VRAMHUB_RELEASE_URL}/vramhub-nautilus-linux-x86_64" || \
+        fatal "Could not download vramhub-nautilus binary from ${VRAMHUB_RELEASE_URL}"
+    chmod +x "$BUILD_DIR/vramhub-nautilus"
+    ok "Downloaded vramhub-nautilus binary"
 
-    # Dockerfile: FROM alpine keeps EIF small; ttyS0 ensures console output
+    # Dockerfile: FROM scratch — binary is static musl, no libc needed
     cat > "$BUILD_DIR/Dockerfile" <<'DEOF'
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
-COPY slcl-nautilus /app/slcl-nautilus
-ENV PORT=3000
-ENTRYPOINT ["/bin/sh", "-c", "exec /app/slcl-nautilus 2>/dev/ttyS0"]
+FROM scratch
+COPY vramhub-nautilus /vramhub-nautilus
+CMD ["/vramhub-nautilus"]
 DEOF
 
     # Check nitro-cli blobs
@@ -375,11 +375,11 @@ DEOF
     [[ -f /etc/nitro_enclaves/nitro_enclaves.conf ]] || \
         echo "blobs_path=${BLOBS_DIR}" > /etc/nitro_enclaves/nitro_enclaves.conf
 
-    docker build -t slcl-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v '^#' | tail -5
+    docker build -t vramhub-nautilus:latest "$BUILD_DIR/" 2>&1 | grep -v '^#' | tail -5
     ok "Docker image built"
 
     nitro-cli build-enclave \
-        --docker-uri slcl-nautilus:latest \
+        --docker-uri vramhub-nautilus:latest \
         --output-file "$EIF_PATH" > "$BUILD_OUT" 2>&1 || {
         cat "$BUILD_OUT" >&2
         fatal "EIF build failed — see above"
@@ -580,14 +580,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
     ok "Downloaded .env.example → ${ENV_FILE}"
 fi
 
-# Flip to production mode
-sed -i 's/^VRAMHUB_TEST_MODE=true/VRAMHUB_TEST_MODE=false/' "$ENV_FILE"
-sed -i 's/^VRAMHUB_NITRO_ENCLAVE=false/VRAMHUB_NITRO_ENCLAVE=true/' "$ENV_FILE"
-grep -q 'VRAMHUB_ENCLAVE_URL' "$ENV_FILE" || \
-    echo 'VRAMHUB_ENCLAVE_URL=http://localhost:3000' >> "$ENV_FILE"
-grep -q 'VRAMHUB_NAUTILUS_URL' "$ENV_FILE" && \
-    sed -i 's|^VRAMHUB_NAUTILUS_URL=.*|VRAMHUB_NAUTILUS_URL=http://localhost:3000|' "$ENV_FILE" || \
-    echo 'VRAMHUB_NAUTILUS_URL=http://localhost:3000' >> "$ENV_FILE"
+# Flip to production mode (binary reads SLCL_ prefix)
+sed -i 's/^SLCL_TEST_MODE=true/SLCL_TEST_MODE=false/' "$ENV_FILE"
+sed -i 's/^SLCL_NITRO_ENCLAVE=false/SLCL_NITRO_ENCLAVE=true/' "$ENV_FILE"
+grep -q 'SLCL_ENCLAVE_URL' "$ENV_FILE" || \
+    echo 'SLCL_ENCLAVE_URL=http://localhost:3000' >> "$ENV_FILE"
+grep -q 'SLCL_NAUTILUS_URL' "$ENV_FILE" && \
+    sed -i 's|^SLCL_NAUTILUS_URL=.*|SLCL_NAUTILUS_URL=http://localhost:3000|' "$ENV_FILE" || \
+    echo 'SLCL_NAUTILUS_URL=http://localhost:3000' >> "$ENV_FILE"
 
 # Check for wallet mnemonic
 _MNEMONIC=$(grep -E '^VRAMHUB_WALLET_MNEMONIC=' "$ENV_FILE" | \
