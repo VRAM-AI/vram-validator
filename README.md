@@ -308,6 +308,63 @@ Current testnet: [VRAMScan Explorer](https://suiscan.xyz/testnet/object/0x48703e
 
 ## Troubleshooting
 
+**`~/.env` is a directory instead of a file**
+If `vi .env` opens a directory listing, a `.env` folder was accidentally created. Remove it and create the file:
+```bash
+rm -rf ~/.env
+vi ~/.env
+```
+
+**Enclave pubkey split across two lines in `.env`**
+Pasting a long value in a terminal can wrap mid-line, breaking `source ~/.env` with errors like `-bash: e1f68: command not found`. Fix:
+```bash
+# Remove all broken ENCLAVE_PUBKEY lines
+sed -i '/^VRAMHUB_ENCLAVE_PUBKEY/d; /^SLCL_ENCLAVE_PUBKEY/d; /^  e1f68$/d' ~/.env
+# Append correct values on one line each
+echo 'VRAMHUB_ENCLAVE_PUBKEY=<your-pubkey>' >> ~/.env
+echo 'SLCL_ENCLAVE_PUBKEY=<your-pubkey>' >> ~/.env
+source ~/.env && echo "OK"
+```
+
+**PCR mismatch after replacing or re-imaging the EC2 instance**
+PCR0 and PCR2 are derived from the enclave binary. If you move to a new instance and rebuild the EIF (or download a new version), the PCR values change. The on-chain `EnclaveRegistry` must be updated by the admin before `register-enclave` will succeed:
+```bash
+# Check current production PCRs
+nitro-cli describe-enclaves | python3 -m json.tool
+# "Flags" must be "NONE" (production mode) — debug-mode PCRs are zeros and will be rejected
+```
+Contact the team on Discord with your PCR0/1/2 values to have the allowlist updated.
+
+**Enclave starts in `DEBUG_MODE` — `register-enclave` fails**
+Stop the debug enclave and restart without `--debug-console`:
+```bash
+sudo nitro-cli terminate-enclave --enclave-id $(nitro-cli describe-enclaves | python3 -c "import sys,json; e=json.load(sys.stdin); print(e[0]['EnclaveID'] if e else '')")
+sudo nitro-cli run-enclave \
+  --eif-path /opt/vram/slcl-nautilus.eif \
+  --memory 4096 \
+  --cpu-count 2 \
+  --enclave-cid 16
+nitro-cli describe-enclaves   # Flags must be "NONE"
+```
+
+**`localhost:3000` connection refused — vsock bridge not running**
+The socat bridge forwards TCP port 3000 to the enclave's vsock socket. If it's not running:
+```bash
+sudo ss -tlnp | grep 3000   # check if anything is listening
+sudo socat TCP-LISTEN:3000,reuseaddr,fork VSOCK-CONNECT:16:3000 &
+curl http://localhost:3000/health_check   # should return: ok
+```
+For a persistent bridge (survives reboots), the full `setup.sh` installs a `slcl-vsock-bridge.service` systemd unit automatically.
+
+**E36 / `No CPUs available in CPU pool` — enclave fails to start on AL2023**
+AL2023 boots secondary CPUs offline; the Nitro driver can't pool them until they're online. `setup.sh` installs a `nitro-cpu-fix.service` that fixes this at boot, but it only takes effect after a reboot:
+```bash
+sudo reboot
+# After ~60s, verify:
+nitro-cli describe-enclaves   # Flags: NONE
+curl http://localhost:3000/health_check   # ok
+```
+
 **"compile_error: must be built on Linux"**
 The validator only runs on Linux. Use an EC2 instance, not your local machine.
 
