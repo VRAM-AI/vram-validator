@@ -469,6 +469,33 @@ if [[ -z "$ENCLAVE_ID" ]]; then
     warn "Enclave failed to start. Diagnostics:"
     cat /tmp/vram-run-enclave.json >&2 || true
     dmesg | grep -iE "nitro|enclave|E36|ne_cpus" | tail -20 >&2 || true
+
+    # E36 / rc=-22 = CPU pool not ready — a reboot lets nitro-cpu-fix.service
+    # run the correct rmmod+modprobe sequence before the allocator starts.
+    if dmesg | grep -q "rc=-22\|No CPUs available in CPU pool"; then
+        echo
+        echo "${C_GREEN}${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  CPU pool not ready (E36 / rc=-22).                     ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║                                                          ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  A one-time reboot is required to let the nitro-cpu-fix ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  service initialize the CPU pool correctly at boot.      ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║                                                          ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  Run:  sudo reboot                                       ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║                                                          ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  After it comes back (~60s), verify:                     ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║    nitro-cli describe-enclaves   # Flags: NONE            ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║    curl http://localhost:3000/health_check  # ok          ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║                                                          ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║  Then register your enclave:                             ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║    source ~/.env                                         ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║    vram-cli register-enclave \\                           ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║      --enclave-url http://localhost:3000 \\               ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}║      --validator-uid \$VRAMHUB_VALIDATOR_UID              ║${C_RESET}"
+        echo "${C_GREEN}${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}"
+        echo
+        exit 0
+    fi
+
     fatal "Enclave did not start. Re-run with ENCLAVE_DEBUG=true for console output."
 fi
 ok "Enclave started: $ENCLAVE_ID"
