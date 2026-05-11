@@ -106,6 +106,8 @@ ssh -i your-key.pem ec2-user@<your-ec2-public-ip>
 
 ---
 
+> **Full deployment runbook:** See [VALIDATOR_DEPLOYMENT.md](./VALIDATOR_DEPLOYMENT.md) for the complete step-by-step guide including the AWS Nitro reboot workaround, vsock bridge setup, Docker deployment, and on-chain registration sequence.
+
 ## Step 3 — Install the validator
 
 Run this on your EC2 instance:
