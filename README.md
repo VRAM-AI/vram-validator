@@ -2,8 +2,6 @@
 
 Earn VRAM rewards by running a validator on the VRAM HUB network. Validators download miner gradients, evaluate them inside a secure hardware enclave, and submit verified scores on the Sui blockchain — every 10 minutes, automatically.
 
-> Backed by a $10M token facility from GEM Digital. Testnet is live.
-
 ---
 
 ## What is a validator?
