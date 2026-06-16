@@ -120,23 +120,26 @@ Fill in:
 
 ```bash
 VRAMHUB_WALLET_MNEMONIC="your twelve word mnemonic here"
-VRAMHUB_VALIDATOR_UID="<your-uid-from-admin>"
 
-# For initial registration leave these as test mode
-VRAMHUB_TEST_MODE="true"
-VRAMHUB_NITRO_ENCLAVE="false"
+# Leave VALIDATOR_UID=0 until after register-validator (Step 6)
+VRAMHUB_VALIDATOR_UID=0
+SLCL_VALIDATOR_UID=0
 
-# R2 credentials (Cloudflare R2 free tier)
-VRAMHUB_R2_ACCOUNT_ID="<your-account-id>"
-VRAMHUB_R2_BUCKET_NAME="vram-validator-gradients"
-VRAMHUB_R2_ACCESS_KEY_ID="<your-r2-key>"
-VRAMHUB_R2_SECRET_ACCESS_KEY="<your-r2-secret>"
+# Testnet mode — no Nitro enclave required
+# The binary reads SLCL_ prefix for mode flags; set both.
+VRAMHUB_TEST_MODE=true
+SLCL_TEST_MODE=true
+VRAMHUB_NITRO_ENCLAVE=false
+SLCL_NITRO_ENCLAVE=false
+VRAMHUB_SKIP_SEAL=true
+SLCL_SKIP_SEAL=true
 
-# If running test mode without real R2, use local filesystem fallback:
-VRAMHUB_R2_LOCAL_DIR=/tmp/vram-local-bucket
+# Storage backend — Walrus is free on testnet, no account needed
+VRAMHUB_STORAGE_BACKEND=walrus
+VRAMHUB_DEMO_MODE=true
 ```
 
-All `SLCL_*` variables should mirror the `VRAMHUB_*` values exactly. Some validator code reads one prefix, some reads the other.
+Everything else (contract IDs, Walrus endpoints, Seal key servers) is pre-filled in `.env.example`.
 
 ## Step 6: Register the validator on chain (if not already done)
 
@@ -164,11 +167,11 @@ Output:
 Registered as validator uid=N
 ```
 
-Save the UID:
+Save the UID (replace N with your assigned number):
 
 ```bash
-sed -i "s|^VRAMHUB_VALIDATOR_UID=.*|VRAMHUB_VALIDATOR_UID=\"N\"|" ~/.env
-sed -i "s|^SLCL_VALIDATOR_UID=.*|SLCL_VALIDATOR_UID=\"N\"|" ~/.env
+sed -i "s|^VRAMHUB_VALIDATOR_UID=.*|VRAMHUB_VALIDATOR_UID=N|" ~/.env
+sed -i "s|^SLCL_VALIDATOR_UID=.*|SLCL_VALIDATOR_UID=N|" ~/.env
 ```
 
 ## Step 7: Register the enclave on chain
@@ -400,8 +403,8 @@ The enclave EIF and on-chain registration do not change unless the enclave binar
 | OS | Amazon Linux 2023 kernel 6.1.166-197.305 |
 | `aws-nitro-enclaves-cli` | 1.4.4 |
 | Docker | 25.0.14 |
-| `vram-validator` | v0.4.19 |
-| Enclave runtime | `slcl-nautilus` v0.4.19 |
+| `vram-validator` | v5.0.0 |
+| Enclave runtime | `slcl-nautilus` v5.0.0 |
 | Sui RPC | testnet `fullnode.testnet.sui.io:443` |
 
 ---

@@ -34,7 +34,6 @@ Think of it like a sealed black box that the network trusts — not because they
 | Storage | 50 GB encrypted EBS volume |
 | OS | Amazon Linux 2023 or Ubuntu 22.04 |
 | Sui wallet | 10 SUI minimum stake on testnet |
-| Cloudflare R2 | Free tier bucket for gradient downloads |
 
 ---
 
@@ -127,20 +126,14 @@ curl -o .env https://raw.githubusercontent.com/VRAM-AI/vram-validator/main/.env.
 nano .env
 ```
 
-The only fields you must fill in:
+The only field you must fill in:
 
 ```bash
 # Your Sui wallet — 12 words, keep this secret
 VRAMHUB_WALLET_MNEMONIC=word1 word2 word3 ... word12
-
-# Cloudflare R2 — create a free bucket at dash.cloudflare.com
-VRAMHUB_R2_ACCOUNT_ID=your-cloudflare-account-id
-VRAMHUB_R2_BUCKET_NAME=vram-validator-gradients
-VRAMHUB_R2_ACCESS_KEY_ID=your-r2-key-id
-VRAMHUB_R2_SECRET_ACCESS_KEY=your-r2-secret
 ```
 
-Everything else (all testnet contract IDs) is pre-filled.
+Everything else — contract IDs, Walrus storage endpoints, testnet mode — is pre-filled.
 
 > **Security tip:** Instead of putting your mnemonic in `.env`, store it in AWS Secrets Manager:
 > ```bash
@@ -153,45 +146,56 @@ Everything else (all testnet contract IDs) is pre-filled.
 
 ---
 
-## Step 5 — Get testnet SUI
+## Step 5 — Register on-chain
 
-You need 10 SUI to stake as a validator.
+Fund your wallet (needs 10 SUI to stake):
 
-1. Get your wallet address:
-   ```bash
-   sui client active-address
-   ```
-2. Visit [faucet.sui.io](https://faucet.sui.io) and paste your address
-3. Confirm you received SUI:
-   ```bash
-   sui client balance
-   ```
+```bash
+# Get your wallet address
+source ~/.env && vram-cli status
+
+# Faucet — run ~11 times (1 SUI per request)
+for i in $(seq 1 11); do
+  curl -s -X POST 'https://faucet.testnet.sui.io/v1/gas' \
+    -H 'Content-Type: application/json' \
+    -d "{\"FixedAmountRequest\":{\"recipient\":\"<YOUR_WALLET_ADDRESS>\"}}" \
+    -o /dev/null -w "Request $i: HTTP %{http_code}\n"
+  sleep 6
+done
+```
+
+Then register the validator:
+
+```bash
+source ~/.env
+vram-cli register-validator
+# Output: Registered as validator uid=N
+```
+
+Save your UID:
+```bash
+echo 'VRAMHUB_VALIDATOR_UID=N' >> ~/.env   # replace N
+echo 'SLCL_VALIDATOR_UID=N' >> ~/.env      # binary reads SLCL_ prefix
+```
 
 ---
 
 ## Step 6 — Run
 
 ```bash
-source .env
-vram-validator
+source ~/.env && vram-validator
 ```
 
-On first run, it auto-registers on-chain and prints your assigned UID:
+Expected output (testnet, simulated mode):
 
 ```
-INFO vramhub_validator: Registered as validator uid=3
-INFO vramhub_validator: Validator starting uid=3
-INFO vramhub_validator: Starting window window=2957300
-INFO vramhub_validator: Decrypting credentials for 12 miners
-INFO vramhub_validator: Submitting 12 scores to chain window=2957300
+INFO slcl_comms::storage: Storage backend: Walrus
+INFO slcl_validator::validator: Validator starting enclave_url="none" validator_uid=N mode=Simulated
+INFO slcl_validator::validator: Starting validation window window=2969327
+INFO slcl_validator::validator: No checkpoint for window, skipping window=2969327
 ```
 
-Add your UID to `.env`:
-```bash
-VRAMHUB_VALIDATOR_UID=3
-```
-
-Restart the validator. It will now run continuously, scoring every 10-minute window automatically.
+`No checkpoint for window, skipping` is normal on testnet — the validator is healthy and waiting for active miners to post gradients. It will loop every 30 seconds automatically.
 
 ---
 
@@ -266,8 +270,9 @@ curl http://localhost:3000/health_check   # must return: ok
 
 ```bash
 source ~/.env
-vram-cli register-validator   # prints VRAMHUB_VALIDATOR_UID=N
-echo 'VRAMHUB_VALIDATOR_UID=N' >> ~/.env   # replace N
+vram-cli register-validator   # prints: Registered as validator uid=N
+echo 'VRAMHUB_VALIDATOR_UID=N' >> ~/.env   # replace N with your uid
+echo 'SLCL_VALIDATOR_UID=N' >> ~/.env
 source ~/.env
 
 vram-cli register-enclave \
@@ -281,11 +286,15 @@ Enclave registered successfully.
 VRAMHUB_ENCLAVE_PUBKEY=42c3adc8...
 ```
 
-Add to `.env`:
+Add to `.env` — paste the pubkey as a single line (do not let it wrap):
 ```bash
 VRAMHUB_ENCLAVE_PUBKEY=42c3adc8...
+SLCL_ENCLAVE_PUBKEY=42c3adc8...
 VRAMHUB_ENCLAVE_URL=http://localhost:3000
 VRAMHUB_TEST_MODE=false
+SLCL_TEST_MODE=false
+VRAMHUB_NITRO_ENCLAVE=true
+SLCL_NITRO_ENCLAVE=true
 ```
 
 > **Note:** You must re-run `register-enclave` any time the enclave EIF is rebuilt (PCR values change when code changes). The validator UID stays the same — only the enclave registration needs to be re-done.
@@ -296,11 +305,11 @@ VRAMHUB_TEST_MODE=false
 
 Every 10-minute window the network runs automatically:
 
-1. **Miners** train on assigned data and upload compressed gradients to Cloudflare R2
+1. **Miners** train on assigned data and upload compressed gradients to Walrus (Sui's decentralized storage)
 2. **Your validator** downloads each gradient and sends it to the Nautilus enclave
 3. **The enclave** computes how much each gradient improved the model, signs the result
 4. **You submit** the signed scores to `score_ledger.move` on Sui
-5. **`reward_distributor.move`** emits **1,200 VRAM** every window, split between miners by score
+5. **`reward_distributor.move`** emits **70 VRAM** every window (Phase 1), split between miners by score
 
 Validators earn a fee from miner stake slashing — separate from the miner emission, so your rewards don't compete with miners.
 
