@@ -29,14 +29,21 @@ install_bin() {
     info "Installed ${dest} → ${INSTALL_DIR}/${dest}"
 }
 
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64)        ARCH_SUFFIX="x86_64" ;;
+  aarch64|arm64) ARCH_SUFFIX="aarch64" ;;
+  *)             error "Unsupported architecture: ${ARCH}" ;;
+esac
+
 info "Fetching latest release..."
 TAG=$(curl -sf "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 [[ -n "$TAG" ]] || error "Could not fetch latest release. Check https://github.com/${REPO}/releases"
-info "Installing ${TAG}..."
+info "Installing ${TAG} (${ARCH_SUFFIX})..."
 
-install_bin "vram-validator-linux-x86_64" "vram-validator"
-install_bin "vram-cli-linux-x86_64"       "vram-cli"
+install_bin "vram-validator-linux-${ARCH_SUFFIX}" "vram-validator"
+install_bin "vram-cli-linux-${ARCH_SUFFIX}"       "vram-cli"
 
 echo ""
 echo -e "${GREEN}✓ vram-validator ${TAG} installed${NC}"
