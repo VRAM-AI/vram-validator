@@ -56,6 +56,20 @@ install_bin "slcl-nautilus-linux-${ARCH_SUFFIX}"   "vram-nautilus"
 install_bin "vram-miner-linux-${ARCH_SUFFIX}"      "vram-miner"
 install_bin "vram-cli-linux-${ARCH_SUFFIX}"        "vram-cli"
 
+# ── GPU sidecar (vram_trainer.py) ──────────────────────────────────────────────
+TRAINER_DEST="/usr/local/bin/vram_trainer.py"
+TRAINER_URL="https://raw.githubusercontent.com/${REPO}/main/vram_trainer.py"
+info "Downloading vram_trainer.py..."
+if [[ $EUID -eq 0 ]] || [[ -w "${INSTALL_DIR}" ]]; then
+    curl -sSfL -o "${TRAINER_DEST}" "${TRAINER_URL}"
+    chmod +x "${TRAINER_DEST}"
+else
+    curl -sSfL -o "/tmp/vram_trainer.py" "${TRAINER_URL}"
+    sudo mv "/tmp/vram_trainer.py" "${TRAINER_DEST}"
+    sudo chmod +x "${TRAINER_DEST}"
+fi
+info "Installed vram_trainer.py → ${TRAINER_DEST}"
+
 # ── ~/.env template ────────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
     info "Creating ${ENV_FILE} from template..."
